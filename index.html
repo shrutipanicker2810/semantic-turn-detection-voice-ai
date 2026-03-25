@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<!--
+  VAD Voice Assistant - Frontend
+
+  Execution order:
+    STEP 1   CSS — design tokens, layout, component styles
+    STEP 2   HTML — static page structure
+    STEP 3   cfg — runtime config object mirroring server defaults
+    STEP 4   DOM refs — cached element references
+    STEP 5   State — module-level mutable variables
+    STEP 6   connectWS() — opens WebSocket and wires all WS event handlers
+    STEP 7   startRecording() — requests mic, creates MediaRecorder, streams audio
+    STEP 8   stopAll() — tears down recorder, stream, and WebSocket
+    STEP 9   speak() — Web Speech API TTS with mic mute/unmute lifecycle
+    STEP 10  setStatus() — updates status bar text and colour class
+    STEP 11  setOrbState() — toggles orb animation class
+    STEP 12  appendBubble() — adds a chat bubble to the history panel
+    STEP 13  Button handlers — btnStart, orb, btnReset, btnClear
+    STEP 14  Config sliders — silence threshold, chunk size, VAD threshold
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VAD Voice Assistant</title>
+
+  <!-- ── STEP 1: Styles ───────────────────────────────────────────────────── -->
+  <style>
+    /* STEP 1-A: Box model reset */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* STEP 1-B: Design tokens */
+    :root {
+      --bg:          #0d0f14;
+      --surface:     #161b26;
+      --border:      #2a3040;
+      --accent:      #4f8ef7;
+      --accent-glow: rgba(79,142,247,.25);
+      --warn:        #f97316;
+      --green:       #22c55e;
+      --muted:       #6b7a99;
+      --text:        #e2e8f4;
+      --radius:      12px;
+      --mono:        "JetBrains Mono", "Fira Code", monospace;
+    }
+
+    /* STEP 1-C: Body — vertical flex column, centred */
+    body {
+      font-family: "Inter", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+      gap: 1.5rem;
+    }
+
+    /* STEP 1-D: Page header */
+    header { text-align: center; }
+    header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -.02em;
+      color: var(--accent);
+    }
+    header p { font-size: .85rem; color: var(--muted); margin-top: .3rem; }
+
+    /* Condition + task label badges */
+    .badge-row {
+      display: flex; gap: .6rem; align-items: center; justify-content: center;
+      flex-wrap: wrap;
+    }
+    .badge {
+      font-size: .72rem; font-weight: 700; letter-spacing: .1em;
+      text-transform: uppercase; padding: .25rem .7rem;
+      border-radius: 20px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--muted);
+    }
+    .badge.condition-a { border-color: #6b7a99; color: #6b7a99; }
+    .badge.condition-b { border-color: #a78bfa; color: #a78bfa; background: rgba(167,139,250,.08); }
+    .badge.condition-c { border-color: #34d399; color: #34d399; background: rgba(52,211,153,.08); }
+    .badge.label-transactional { border-color: #60a5fa; color: #60a5fa; background: rgba(96,165,250,.08); }
+    .badge.label-informational { border-color: #fbbf24; color: #fbbf24; background: rgba(251,191,36,.08); }
+    .badge.label-reflective    { border-color: #f472b6; color: #f472b6; background: rgba(244,114,182,.08); }
+    .badge.label-unknown       { border-color: var(--border); color: var(--muted); }
+
+    /* Opening prompt card */
+    .opening-prompt {
+      width: 100%; max-width: 560px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+      font-size: .92rem;
+      line-height: 1.65;
+      color: var(--muted);
+      text-align: center;
+    }
+    .opening-prompt-label {
+      font-size: .7rem; font-weight: 600; letter-spacing: .12em;
+      text-transform: uppercase; color: var(--muted); margin-bottom: .5rem;
+    }
+    .opening-prompt-text { color: var(--text); }
+
+    /* Ensemble score panel — only visible in conditions B and C */
+    #score-panel {
+      width: 100%; max-width: 680px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: .75rem 1.25rem;
+      display: none;
+    }
+    #score-panel.visible { display: block; }
+    .score-row {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: .8rem; color: var(--muted); margin-bottom: .3rem;
+    }
+    .score-row:last-child { margin-bottom: 0; }
+    .score-bar-wrap { flex: 1; margin: 0 .75rem; height: 5px; background: var(--border); border-radius: 4px; overflow: hidden; }
+    .score-bar { height: 100%; border-radius: 4px; transition: width .3s ease; background: var(--accent); }
+    .score-bar.combined { background: var(--green); }
+    .score-bar.over-threshold { background: #22c55e; }
+    .score-val { min-width: 2.5rem; text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+
+    /* STEP 1-E: Mic orb — idle (grey), listening (blue pulse), responding (orange) */
+    .orb-wrap { display: flex; flex-direction: column; align-items: center; gap: 1rem; }
+
+    #orb {
+      width: 96px; height: 96px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 2px solid var(--border);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: border-color .2s, box-shadow .2s;
+      position: relative;
+    }
+    #orb svg { width: 36px; height: 36px; fill: var(--muted); transition: fill .2s; }
+
+    #orb.listening {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 6px var(--accent-glow), 0 0 0 12px rgba(79,142,247,.08);
+      animation: pulse 1.8s ease-in-out infinite;
+    }
+    #orb.listening svg { fill: var(--accent); }
+
+    #orb.responding { border-color: var(--warn); box-shadow: 0 0 0 6px rgba(249,115,22,.2); }
+    #orb.responding svg { fill: var(--warn); }
+
+    @keyframes pulse {
+      0%,100% { box-shadow: 0 0 0 6px var(--accent-glow), 0 0 0 12px rgba(79,142,247,.08); }
+      50%      { box-shadow: 0 0 0 10px var(--accent-glow), 0 0 0 20px rgba(79,142,247,.04); }
+    }
+
+    .orb-label { font-size: .8rem; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+
+    /* STEP 1-F: Status bar — colour toggled via JS class */
+    #status-bar {
+      font-size: .85rem; color: var(--muted);
+      min-height: 1.2em; text-align: center; transition: color .3s;
+    }
+    #status-bar.active { color: var(--green); }
+    #status-bar.warn   { color: var(--warn);  }
+
+    /* STEP 1-G: Cards — shared shell for transcript and response */
+    .card {
+      width: 100%; max-width: 680px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+    }
+    .card-label {
+      font-size: .7rem; font-weight: 600;
+      letter-spacing: .12em; text-transform: uppercase;
+      color: var(--muted); margin-bottom: .6rem;
+    }
+    .card-body {
+      font-size: .9rem; line-height: 1.65; min-height: 2.5rem;
+      font-family: var(--mono); white-space: pre-wrap;
+      word-break: break-word; color: var(--text);
+    }
+    #transcript-body { color: #a5b4d4; }
+
+    /* STEP 1-H: Conversation history panel — scrollable bubble list */
+    #history {
+      width: 100%; max-width: 680px;
+      display: flex; flex-direction: column; gap: .75rem;
+      max-height: 40vh; overflow-y: auto; padding-right: .25rem;
+    }
+    #history::-webkit-scrollbar { width: 4px; }
+    #history::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .bubble { max-width: 85%; padding: .6rem 1rem; border-radius: var(--radius); font-size: .88rem; line-height: 1.55; }
+    .bubble.user      { align-self: flex-end; background: rgba(79,142,247,.15); border: 1px solid rgba(79,142,247,.3); color: #c8d9f8; }
+    .bubble.assistant { align-self: flex-start; background: #1e2535; border: 1px solid var(--border); }
+    .bubble-role { font-size: .7rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin-bottom: .3rem; }
+
+    /* STEP 1-I: Control buttons */
+    .controls { display: flex; gap: .75rem; }
+    button {
+      padding: .5rem 1.2rem; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--surface);
+      color: var(--text); font-size: .85rem; cursor: pointer;
+      transition: background .15s, border-color .15s;
+    }
+    button:hover { background: #1e2535; border-color: var(--accent); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+
+    /* Latency badge inside assistant bubble header */
+    .bubble-latency {
+      font-size: .65rem; font-weight: 400; letter-spacing: .04em;
+      color: var(--muted); margin-left: .5rem; opacity: .75;
+    }
+
+    /* Condition selector */
+    .condition-selector {
+      display: flex; align-items: center; gap: .35rem;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 20px; padding: .2rem .5rem .2rem .75rem;
+    }
+    .condition-selector-label {
+      font-size: .7rem; font-weight: 600; letter-spacing: .1em;
+      text-transform: uppercase; color: var(--muted); margin-right: .15rem;
+    }
+    .cond-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 2rem; height: 1.6rem; border-radius: 12px; cursor: pointer;
+      font-size: .75rem; font-weight: 700; letter-spacing: .06em;
+      text-transform: uppercase; border: 1px solid transparent;
+      transition: background .15s, border-color .15s, color .15s;
+      color: var(--muted);
+    }
+    .cond-btn input[type=radio] { display: none; }
+    .cond-btn:hover { background: rgba(255,255,255,.06); }
+    .cond-btn.active.cond-a { background: rgba(107,122,153,.2); border-color: #6b7a99; color: #6b7a99; }
+    .cond-btn.active.cond-b { background: rgba(167,139,250,.15); border-color: #a78bfa; color: #a78bfa; }
+    .cond-btn.active.cond-c { background: rgba(52,211,153,.15); border-color: #34d399; color: #34d399; }
+    button.primary:hover { background: #3b7ff5; }
+    button:disabled { opacity: .45; cursor: default; }
+
+    /* Config / debug panel */
+    details { width: 100%; max-width: 680px; font-size: .8rem; color: var(--muted); }
+    summary { cursor: pointer; user-select: none; }
+    .config-row { display: flex; align-items: center; gap: .5rem; margin-top: .5rem; }
+    .config-row label { min-width: 200px; }
+    .config-row input[type=range] { flex: 1; accent-color: var(--accent); }
+    .config-row span { min-width: 3rem; text-align: right; }
+  </style>
+</head>
+
+<!-- HTML structure -->
+<body>
+
+<!-- Page header -->
+<header>
+  <h1>Semantic Turn Detection</h1>
+  <p>Deliberative Voice AI Study</p>
+</header>
+
+<!-- Condition selector + task label badges -->
+<div class="badge-row">
+  <div class="condition-selector" id="condition-selector">
+    <span class="condition-selector-label">Condition</span>
+    <label class="cond-btn cond-a active" id="cond-btn-a">
+      <input type="radio" name="condition" value="A" checked> A
+    </label>
+    <label class="cond-btn cond-b" id="cond-btn-b">
+      <input type="radio" name="condition" value="B"> B
+    </label>
+    <label class="cond-btn cond-c" id="cond-btn-c">
+      <input type="radio" name="condition" value="C"> C
+    </label>
+  </div>
+  <div class="badge label-unknown" id="badge-label" style="display:none">—</div>
+  <div class="badge" id="badge-stable" style="display:none">stable</div>
+</div>
+
+<!-- Opening prompt — displayed as static text, no TTS -->
+<div class="opening-prompt">
+  <div class="opening-prompt-label">The AI will ask you</div>
+  <div class="opening-prompt-text">
+    Hi, I'm here to help you think through a decision. What's a decision you're currently weighing? It could be about a course, a project direction, or anything you've been going back and forth on.
+  </div>
+</div>
+
+<!-- Mic orb — clickable state indicator -->
+<div class="orb-wrap">
+  <div id="orb" title="Click to start / stop">
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4zm6.364 9.636a1 1 0 0 1 1 1A7.364 7.364 0 0 1 13 18.917V21h2a1 1 0 1 1 0 2H9a1 1 0 1 1 0-2h2v-2.083A7.364 7.364 0 0 1 4.636 11.636a1 1 0 0 1 2 0 5.364 5.364 0 0 0 10.728 0 1 1 0 0 1 1-1z"/>
+    </svg>
+  </div>
+  <div class="orb-label" id="orb-label">idle</div>
+</div>
+
+<!-- Status bar -->
+<div id="status-bar">Click the mic to begin</div>
+
+<!-- Rolling transcript card -->
+<div class="card">
+  <div class="card-label">Rolling transcript (u_t)</div>
+  <div class="card-body" id="transcript-body">—</div>
+</div>
+
+<!-- Ensemble score panel (visible in Conditions B and C) -->
+<div id="score-panel">
+  <div class="card-label">Ensemble scoring</div>
+  <div class="score-row">
+    <span style="min-width:5rem">EOS</span>
+    <div class="score-bar-wrap"><div class="score-bar" id="bar-eos" style="width:0%"></div></div>
+    <span class="score-val" id="val-eos">—</span>
+  </div>
+  <div class="score-row">
+    <span style="min-width:5rem">LLM scorer</span>
+    <div class="score-bar-wrap"><div class="score-bar" id="bar-llm" style="width:0%"></div></div>
+    <span class="score-val" id="val-llm">—</span>
+  </div>
+  <div class="score-row" style="margin-top:.4rem;padding-top:.4rem;border-top:1px solid var(--border)">
+    <span style="min-width:5rem">Combined</span>
+    <div class="score-bar-wrap"><div class="score-bar combined" id="bar-combined" style="width:0%"></div></div>
+    <span class="score-val" id="val-combined">—</span>
+  </div>
+  <div class="score-row" style="margin-top:.3rem;font-size:.72rem">
+    <span style="color:var(--muted)">Threshold: <span id="val-threshold">0.60</span> / <span id="val-high-conf-threshold" title="High-confidence early-fire threshold">0.85⚡</span></span>
+    <span style="color:var(--muted)">Dynamic silence: <span id="val-dyn-threshold">—</span>s</span>
+    <span id="score-decision" style="font-weight:700"></span>
+  </div>
+</div>
+
+<!-- Conversation history -->
+<div id="history"></div>
+
+<!-- Control buttons -->
+<div class="controls">
+  <button class="primary" id="btn-start">Start Listening</button>
+  <button id="btn-reset" disabled>Reset Turn</button>
+  <button id="btn-clear">Clear History</button>
+  <button id="btn-save-log" title="Download session log JSON">Save Log</button>
+</div>
+
+<!-- Collapsible config panel -->
+<details>
+  <summary>⚙ Config</summary>
+  <div class="config-row">
+    <label>Silence threshold (VAD baseline) (s)</label>
+    <input type="range" id="cfg-silence" min="0.3" max="3" step="0.1" value="1.0" />
+    <span id="cfg-silence-val">1.0 s</span>
+  </div>
+  <div class="config-row">
+    <label>Audio chunk size (ms) — takes effect on next session start</label>
+    <input type="range" id="cfg-chunk" min="100" max="1000" step="100" value="300" />
+    <span id="cfg-chunk-val">300 ms</span>
+  </div>
+  <div class="config-row">
+    <label>VAD speech threshold (0–1, higher = less sensitive)</label>
+    <input type="range" id="cfg-vad" min="0.3" max="0.95" step="0.05" value="0.85" />
+    <span id="cfg-vad-val">0.85</span>
+  </div>
+  <p style="margin-top:.5rem;color:#6b7a99;font-size:.75rem">
+    [!] If the mic never stops, background noise is above the threshold.
+    Move the VAD slider higher (0.75–0.85) and restart the server with
+    <code>SPEECH_PROB_THRESHOLD = &lt;value&gt;</code> in server.py.
+    Current server default: <strong>0.85</strong>
+  </p>
+</details>
+
+<script>
+// ── STEP 3: Runtime config ─────────────────────────────────────────────────────
+const cfg = {
+  silenceThresholdS:    1.0,  // must match VAD_SILENCE_THRESHOLD_S in server.py
+  chunkMs:              300,
+  speechProbThreshold:  0.85,
+};
+
+// ── STEP 4: DOM reference cache ───────────────────────────────────────────────
+const orb          = document.getElementById("orb");
+const orbLabel     = document.getElementById("orb-label");
+const statusBar    = document.getElementById("status-bar");
+const transcriptEl = document.getElementById("transcript-body");
+const historyEl    = document.getElementById("history");
+const btnStart     = document.getElementById("btn-start");
+const btnReset     = document.getElementById("btn-reset");
+const btnClear     = document.getElementById("btn-clear");
+const btnSaveLog   = document.getElementById("btn-save-log");
+const cfgChunkEl   = document.getElementById("cfg-chunk");
+
+// Condition / scoring UI refs
+const badgeLabel      = document.getElementById("badge-label");
+const badgeStable     = document.getElementById("badge-stable");
+const scorePanel      = document.getElementById("score-panel");
+const barEos          = document.getElementById("bar-eos");
+const barLlm          = document.getElementById("bar-llm");
+const barCombined     = document.getElementById("bar-combined");
+const valEos          = document.getElementById("val-eos");
+const valLlm          = document.getElementById("val-llm");
+const valCombined     = document.getElementById("val-combined");
+const valThreshold    = document.getElementById("val-threshold");
+const valHighConfThreshold = document.getElementById("val-high-conf-threshold");
+const valDynThreshold = document.getElementById("val-dyn-threshold");
+const scoreDecision   = document.getElementById("score-decision");
+
+// ── STEP 5: Module-level state ────────────────────────────────────────────────
+let ws            = null;
+let mediaRecorder = null;
+let stream        = null;
+let listening     = false;
+let micMuted      = false;
+let activeCondition = "A";
+let lastTurnFireMs  = null;  // wall-clock ms when the last turn fired (for total latency)
+let pendingCondition = null; // condition selected before WS was open — sent on connect
+
+// ── Condition selector wiring ─────────────────────────────────────────────────
+const condBtnA = document.getElementById("cond-btn-a");
+const condBtnB = document.getElementById("cond-btn-b");
+const condBtnC = document.getElementById("cond-btn-c");
+
+function applyConditionUI(cond) {
+  activeCondition = cond;
+  [condBtnA, condBtnB, condBtnC].forEach(btn => btn.classList.remove("active"));
+  const target = document.getElementById(`cond-btn-${cond.toLowerCase()}`);
+  if (target) target.classList.add("active");
+
+  // Always reset task label and scoring panel when switching conditions
+  // so stale labels from a previous condition don't bleed through.
+  badgeLabel.textContent    = "—";
+  badgeLabel.className      = "badge label-unknown";
+  badgeStable.style.display = "none";
+  barEos.style.width        = "0%";
+  barLlm.style.width        = "0%";
+  barCombined.style.width   = "0%";
+  valEos.textContent        = "—";
+  valLlm.textContent        = "—";
+  valCombined.textContent   = "—";
+  valDynThreshold.textContent = "—";
+  scoreDecision.textContent = "";
+
+  if (cond !== "A") {
+    scorePanel.classList.add("visible");
+    badgeLabel.style.display = "";
+  } else {
+    scorePanel.classList.remove("visible");
+    badgeLabel.style.display = "none";
+  }
+}
+
+function sendCondition(cond) {
+  applyConditionUI(cond);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "set_condition", condition: cond }));
+  } else {
+    // WS not open yet — store it and send when the connection opens
+    pendingCondition = cond;
+    console.log("Condition", cond, "queued — will send on connect.");
+  }
+}
+
+document.querySelectorAll('input[name="condition"]').forEach(radio => {
+  radio.addEventListener("change", () => {
+    if (radio.checked) sendCondition(radio.value);
+  });
+});
+
+// Fetch current condition from server on load and sync UI
+async function fetchCondition() {
+  try {
+    const res  = await fetch("/condition");
+    const data = await res.json();
+    applyConditionUI(data.condition || "A");
+    // Sync radio button to server state
+    const radio = document.querySelector(`input[name="condition"][value="${data.condition}"]`);
+    if (radio) radio.checked = true;
+  } catch (e) {
+    console.warn("Could not fetch condition:", e);
+  }
+}
+fetchCondition();
+
+// ── STEP 6: WebSocket setup ───────────────────────────────────────────────────
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    // Send any condition that was selected before the WS was open
+    if (pendingCondition) {
+      ws.send(JSON.stringify({ type: "set_condition", condition: pendingCondition }));
+      console.log("Sent queued condition:", pendingCondition);
+      pendingCondition = null;
+    }
+    setStatus("[READY] Click the mic and start speaking", "active");
+    startRecording();
+  };
+
+  ws.onclose = (evt) => {
+    // Code 1000 = normal closure (user clicked Stop, or server shut down intentionally).
+    // Anything else is unexpected — auto-reconnect after a short delay.
+    if (evt.code === 1000 || !listening) {
+      setStatus("[READY] Click the mic to begin");
+      stopAll();
+    } else {
+      setStatus("[RECONNECTING] Connection lost — reconnecting ...", "warn");
+      console.debug("WS closed unexpectedly (code=%d) — reconnecting in 1.5s", evt.code);
+      ws = null;
+
+      // Fully tear down the MediaRecorder AND the stream track.
+      // If we keep the stream and just recreate the MediaRecorder, the new
+      // recorder starts mid-stream — Chrome won't emit an EBML header for it,
+      // so every chunk it sends is undecodable on the server and VAD never fires.
+      // A fresh getUserMedia() call guarantees a clean WebM container from byte 0.
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+      mediaRecorder = null;
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+
+      setTimeout(() => {
+        if (listening) {
+          console.log("Auto-reconnecting WebSocket...");
+          connectWS();
+        }
+      }, 1500);
+    }
+  };
+
+  ws.onerror = (e) => {
+    // onerror always fires just before onclose — log it but let onclose handle recovery.
+    console.error("WS error", e);
+  };
+
+  ws.onmessage = (evt) => {
+    let msg;
+    try {
+      msg = JSON.parse(evt.data);
+    } catch (err) {
+      console.warn("WS message parse error:", err, evt.data);
+      return;
+    }
+
+    if (msg.type === "status") {
+      setStatus(msg.text, msg.text.startsWith("[ERROR]") ? "warn" : "");
+    }
+
+    if (msg.type === "transcript") {
+      transcriptEl.textContent = msg.text;
+      // Record wall-clock time when the transcript arrives. This is after
+      // transcription completes on the server, so "total" latency shown on
+      // assistant bubbles measures from transcript-ready to response-ready —
+      // i.e. the LLM round-trip only. True end-to-end latency (VAD fire →
+      // response) is captured server-side in the turn log.
+      lastTurnFireMs = Date.now();
+      // Only reset the label badge if there's a real transcript — empty/short
+      // turns (false fires) shouldn't wipe the previous label.
+      if (activeCondition === "C" && msg.text && msg.text.trim().length > 3) {
+        badgeLabel.className   = "badge label-unknown";
+        badgeLabel.style.display = "";
+        badgeStable.style.display = "none";
+        // Keep previous text visible but dimmed rather than showing "..."
+        // The label will be updated by task_label or scoring messages shortly.
+      }
+      setStatus("[MIC] Listening ...", "active");
+    }
+
+    if (msg.type === "silence") {
+      // For Condition A: show progress toward the VAD silence threshold.
+      // For B/C: the turn fires on EOS/ensemble approval, not a fixed threshold,
+      // so show elapsed time only — no denominator that would imply a fixed cutoff.
+      const delta = msg.delta_t.toFixed(1);
+      const pct   = Math.min(msg.delta_t / 6.0, 1.0);  // always cap bar at MAX_SILENCE_S
+      const filled = Math.round(pct * 10);
+      const bar   = `[${"#".repeat(filled)}${"-".repeat(10 - filled)}]`;
+      if (activeCondition === "A") {
+        const threshold = cfg.silenceThresholdS;
+        const pctA  = Math.min(msg.delta_t / threshold, 1.0);
+        const fillA = Math.round(pctA * 10);
+        setStatus(
+          `[SILENCE] ${delta}s / ${threshold.toFixed(1)}s  ` +
+          `[${"#".repeat(fillA)}${"-".repeat(10 - fillA)}]`
+        );
+      } else {
+        setStatus(`[SILENCE] ${delta}s  ${bar}`);
+      }
+    }
+
+    if (msg.type === "scoring") {
+      try {
+        const lbl = msg.task_label || "unknown";
+        if (lbl !== "unknown") {
+          badgeLabel.textContent   = lbl;
+          badgeLabel.className     = `badge label-${lbl}`;
+          badgeLabel.style.display = "";
+          badgeStable.style.display = "";
+        }
+
+        const eos  = typeof msg.eos_score      === "number" ? msg.eos_score      : 0;
+        const llm  = typeof msg.llm_score      === "number" ? msg.llm_score      : 0;
+        const comb = typeof msg.combined_score === "number" ? msg.combined_score : 0;
+
+        barEos.style.width      = `${Math.round(eos  * 100)}%`;
+        barLlm.style.width      = `${Math.round(llm  * 100)}%`;
+        barCombined.style.width = `${Math.round(comb * 100)}%`;
+
+        valEos.textContent      = eos.toFixed(2);
+        valLlm.textContent      = llm.toFixed(2);
+        valCombined.textContent = comb.toFixed(2);
+
+        valThreshold.textContent    = (msg.threshold || 0.65).toFixed(2);
+        if (valHighConfThreshold && msg.high_conf_threshold != null) {
+          valHighConfThreshold.textContent = msg.high_conf_threshold.toFixed(2) + "⚡";
+        }
+        valDynThreshold.textContent = msg.dyn_threshold_s != null
+          ? msg.dyn_threshold_s.toFixed(1) : "—";
+
+        barCombined.classList.toggle("over-threshold", msg.fire === true);
+        if (msg.fire && msg.early_fire) {
+          scoreDecision.textContent = "⚡ EARLY FIRE";
+          scoreDecision.style.color = "var(--green)";
+        } else if (msg.fire) {
+          scoreDecision.textContent = "▶ FIRE";
+          scoreDecision.style.color = "var(--green)";
+        } else {
+          scoreDecision.textContent = "⏸ HOLD";
+          scoreDecision.style.color = "var(--warn)";
+        }
+      } catch (err) {
+        console.error("scoring handler error:", err, msg);
+      }
+    }
+
+    if (msg.type === "ping") {
+      return;
+    }
+
+    if (msg.type === "task_label") {
+      const lbl = msg.label || "unknown";
+      badgeLabel.textContent = lbl;
+      badgeLabel.className   = `badge label-${lbl}`;
+      badgeLabel.style.display = "";
+      // Show/hide the stable badge
+      badgeStable.style.display = msg.stable ? "" : "none";
+      // Update dynamic silence threshold display live
+      if (valDynThreshold && msg.dyn_threshold_s != null) {
+        valDynThreshold.textContent =
+          typeof msg.dyn_threshold_s === "number"
+            ? msg.dyn_threshold_s.toFixed(1)
+            : msg.dyn_threshold_s;
+      }
+    }
+
+    if (msg.type === "condition_ack") {
+      applyConditionUI(msg.condition);
+      console.log("Condition confirmed by server:", msg.condition);
+    }
+
+    if (msg.type === "response") {
+      const lastTranscript =
+        transcriptEl.textContent !== "—" ? transcriptEl.textContent : "(no transcript)";
+      appendBubble("user", lastTranscript);
+      appendBubble("assistant", msg.text, msg.response_ms);
+      transcriptEl.textContent = "—";
+      speak(msg.text);
+    }
+  };
+}
+
+// ── STEP 7: Microphone capture ────────────────────────────────────────────────
+async function startRecording() {
+  // ── Tear down any lingering stream/recorder before requesting a new one ──
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+  }
+  mediaRecorder = null;
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+  } catch (err) {
+    setStatus("[ERROR] Microphone access denied", "warn");
+    return;
+  }
+
+  // Force WebM/Opus — Chrome on Windows reports WAV support but the server
+  // expects WebM cluster format. Never use audio/wav here.
+  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : "audio/webm";
+
+  mediaRecorder = new MediaRecorder(stream, { mimeType });
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (micMuted) return;
+    if (e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(e.data);
+    }
+  };
+
+  mediaRecorder.start(cfg.chunkMs);
+
+  listening = true;
+  setOrbState("listening");
+  orbLabel.textContent = "listening";
+  btnStart.textContent = "Stop";
+  btnReset.disabled    = false;
+  cfgChunkEl.disabled  = true;
+}
+
+// ── STEP 8: Full teardown ─────────────────────────────────────────────────────
+function stopAll() {
+  listening = false;
+  // Cancel any in-flight TTS so its onend/onerror cannot fire after teardown
+  // and attempt to re-enable a mic that no longer has an open WS.
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+  micMuted = false;
+  if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+  mediaRecorder       = null;
+  stream              = null;
+  ws                  = null;
+  cfgChunkEl.disabled = false;
+  setOrbState("");
+  orbLabel.textContent = "idle";
+  btnStart.textContent = "Start Listening";
+  btnReset.disabled    = true;
+}
+
+// ── STEP 9: TTS lifecycle ─────────────────────────────────────────────────────
+function speak(text) {
+  if (!window.speechSynthesis) {
+    console.warn("speechSynthesis not available — TTS disabled.");
+    return;
+  }
+  window.speechSynthesis.cancel();
+
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.rate  = 1.05;
+  utt.pitch = 1.0;
+
+  setOrbState("responding");
+  orbLabel.textContent = "speaking";
+  setStatus("[TTS] Speaking ...");
+
+  // Debounce flag: the Web Speech API can fire onend multiple times on long
+  // responses because Chrome internally segments TTS. Without this guard,
+  // each segment completion sends a "reset" to the server and resets warmup
+  // mid-speech on the next turn, causing the mic to ignore the user's voice.
+  let resetSent = false;
+
+  utt.onend = () => {
+    if (resetSent) {
+      console.debug("speak: onend fired again — ignoring duplicate.");
+      return;
+    }
+    resetSent = true;
+    setTimeout(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "reset" }));
+      }
+      setTimeout(() => {
+        micMuted = false;
+        setOrbState("listening");
+        orbLabel.textContent = "listening";
+        setStatus("[READY] Listening ...", "active");
+      }, 300);
+    }, 1500);
+  };
+
+  utt.onerror = () => {
+    if (!resetSent) {
+      resetSent = true;
+      setTimeout(() => { micMuted = false; }, 500);
+    }
+    setOrbState("listening");
+    orbLabel.textContent = "listening";
+  };
+
+  micMuted = true;
+  window.speechSynthesis.speak(utt);
+}
+
+// ── STEP 10: Status bar helper ────────────────────────────────────────────────
+function setStatus(text, cls = "") {
+  statusBar.textContent = text;
+  statusBar.className   = cls;
+}
+
+// ── STEP 11: Orb state helper ─────────────────────────────────────────────────
+function setOrbState(state) {
+  orb.className = state;
+}
+
+// ── STEP 12: Chat bubble renderer ─────────────────────────────────────────────
+function appendBubble(role, text, responseMs) {
+  const wrap  = document.createElement("div");
+  wrap.className = `bubble ${role}`;
+
+  const label = document.createElement("div");
+  label.className   = "bubble-role";
+
+  // For assistant bubbles, show response latency if available
+  if (role === "assistant" && responseMs != null) {
+    const llmRoundtripMs = lastTurnFireMs != null ? (Date.now() - lastTurnFireMs) : null;
+    label.innerHTML = `Assistant <span class="bubble-latency">${responseMs}ms LLM${llmRoundtripMs != null ? " · " + llmRoundtripMs + "ms transcript→response" : ""}</span>`;
+  } else {
+    label.textContent = role === "user" ? "You" : "Assistant";
+  }
+
+  const body = document.createElement("div");
+  body.textContent = text;
+
+  wrap.appendChild(label);
+  wrap.appendChild(body);
+  historyEl.appendChild(wrap);
+  historyEl.scrollTop = historyEl.scrollHeight;
+}
+
+// ── STEP 13: Button handlers ──────────────────────────────────────────────────
+
+btnStart.addEventListener("click", () => {
+  if (listening) { stopAll(); } else { connectWS(); }
+});
+
+orb.addEventListener("click", () => btnStart.click());
+
+btnReset.addEventListener("click", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "reset" }));
+    transcriptEl.textContent = "—";
+    setStatus("[READY] Turn reset", "active");
+  }
+});
+
+btnClear.addEventListener("click", () => {
+  historyEl.innerHTML      = "";
+  transcriptEl.textContent = "—";
+
+  if (listening) {
+    setStatus("[READY] Restarting session ...");
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+    mediaRecorder = null;
+    ws            = null;
+    micMuted      = false;
+    // Reset orb to listening state so it shows correctly once connectWS() fires.
+    setOrbState("");
+    orbLabel.textContent = "idle";
+    setTimeout(() => { connectWS(); }, 500);
+  }
+});
+
+btnSaveLog.addEventListener("click", async () => {
+  try {
+    const res  = await fetch("/session-log");
+    const data = await res.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    const ts   = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    a.href     = url;
+    a.download = `session_log_condition${activeCondition}_${ts}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus("[LOG] Session log downloaded.", "active");
+  } catch (e) {
+    setStatus("[ERROR] Could not fetch session log.", "warn");
+    console.error(e);
+  }
+});
+
+// ── STEP 14: Config sliders ───────────────────────────────────────────────────
+
+document.getElementById("cfg-silence").addEventListener("input", (e) => {
+  cfg.silenceThresholdS = parseFloat(e.target.value);
+  document.getElementById("cfg-silence-val").textContent = `${cfg.silenceThresholdS} s`;
+});
+
+cfgChunkEl.addEventListener("input", (e) => {
+  cfg.chunkMs = parseInt(e.target.value, 10);
+  document.getElementById("cfg-chunk-val").textContent = `${cfg.chunkMs} ms`;
+});
+
+document.getElementById("cfg-vad").addEventListener("input", (e) => {
+  cfg.speechProbThreshold = parseFloat(e.target.value);
+  document.getElementById("cfg-vad-val").textContent = cfg.speechProbThreshold.toFixed(2);
+});
+
+</script>
+</body>
+</html>
