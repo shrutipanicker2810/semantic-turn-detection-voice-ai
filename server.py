@@ -497,10 +497,9 @@ async def _run_onset_transcription(state: "ConnectionState") -> None:
     Cancelled automatically by reset_turn() or when speech resumes.
     """
     try:
-        # Wait half the silence threshold before transcribing. This ensures the
-        # speaker's final words have landed in webm_session_buf while giving the
-        # Groq call a head start, so the onset transcript is ready earlier and
-        # the ensemble has more time to score before the 4.0s hard cap.
+        # Wait half the silence threshold before transcribing — enough for the
+        # speaker's final words to land in webm_session_buf while giving the
+        # Groq call a head start before the ensemble needs the result.
         await asyncio.sleep(VAD_SILENCE_THRESHOLD_S / 2)
         result = await transcribe_utterance(
             list(state.pcm_chunks),
@@ -563,7 +562,7 @@ def _strip_prefix_fuzzy(full_text: str, prev_text: str) -> str:
     return full_text
 
 
-## Transcription dispatcher
+## Transcription dispatcher 
 async def transcribe_utterance(
     pcm_frames: list[np.ndarray],
     raw_chunks: list[bytes],
@@ -571,15 +570,16 @@ async def transcribe_utterance(
     final: bool = False,
 ) -> str:
     """
-    Transcribes the current utterance via Groq Whisper.
+    Routes the utterance to Groq Whisper for transcription.
 
-    Always sends the full webm_session_buf rather than a per-turn slice —
-    Chrome WebM clusters are not self-contained and slicing from an offset
-    produces invalid input. The current turn's text is isolated by stripping
-    the cumulative prev_transcript prefix using fuzzy matching.
+    Always sends the full webm_session_buf — Chrome/Windows clusters are not
+    self-contained so offset slices produce invalid WebM. To isolate the current
+    turn's text, we strip any prefix that matches state.prev_transcript (the
+    cumulative transcript of all previous turns in this session).
 
-    Returns an empty string if no audio frames are available or the Groq call fails.
-    Records transcription latency in state.latency["transcription"] if state is provided.
+    Falls back gracefully if Groq fails and local Whisper is not loaded.
+    Returns an empty string if no frames or no audio bytes are available.
+    If state is provided, records latency in state.latency["transcription"].
     """
     if not pcm_frames:
         return ""
@@ -1283,7 +1283,7 @@ def load_models() -> None:
         repo_or_dir="snakers4/silero-vad",
         model="silero_vad",
         force_reload=False,
-        onnx=False,
+        onnx=True,
         trust_repo=True,
     )
     Models.vad_model.eval()
