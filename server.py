@@ -1278,13 +1278,21 @@ def load_models() -> None:
         log.info("AsyncGroq client initialised.")
 
     log.info("Loading Silero VAD …")
-    # Download the JIT model file directly from Silero's CDN rather than using
-    # torch.hub or the silero-vad pip package, both of which unconditionally
-    # import torchaudio at the module level — incompatible with torch==2.2.2+cpu
-    # on Railway because pip installs a newer torchaudio whose compiled extension
-    # references ABI symbols that don't exist in torch 2.2.2.
-    model_path = Path(os.environ.get("HOME", "/root")) / ".cache" / "silero_vad.jit"
-    if not model_path.exists():
+    # Check for a bundled model file in the app directory first (committed to repo).
+    # This avoids a GitHub download on every cold start, which stalls startup for
+    # 10–30s depending on network conditions. Falls back to download only if the
+    # bundled file is absent (e.g. first deploy before the file was committed).
+    bundled_path = Path(__file__).parent / "silero_vad.jit"
+    cache_path   = Path(os.environ.get("HOME", "/root")) / ".cache" / "silero_vad.jit"
+
+    if bundled_path.exists():
+        model_path = bundled_path
+        log.info("Using bundled Silero VAD model.")
+    elif cache_path.exists():
+        model_path = cache_path
+        log.info("Using cached Silero VAD model.")
+    else:
+        model_path = cache_path
         model_path.parent.mkdir(parents=True, exist_ok=True)
         log.info("Downloading Silero VAD model weights …")
         torch.hub.download_url_to_file(
