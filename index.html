@@ -438,7 +438,12 @@
     </div>
 
   </div>
-  <p class="home-footer-note">Each session takes ~5 minutes. After each condition you'll be asked to fill out a short survey before returning here to try the next one.</p>
+  <p class="home-footer-note">Each session takes ~5 minutes. Fill out the survey as you go. Record your experience after each condition before moving to the next.</p>
+  <a class="survey-banner" id="survey-link" href="https://docs.google.com/forms/d/e/1FAIpQLSejsrunarPUuWSqQe1kLdkeuk6us669MwjQ4geYu58HYUgYNw/viewform" target="_blank" rel="noopener" style="margin-top:.5rem">
+    <svg viewBox="0 0 24 24"><path d="M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-7 14H7v-2h5v2zm5-4H7v-2h10v2zm0-4H7V7h10v2z"/></svg>
+    <span class="survey-label">Survey</span>
+    Complete feedback form
+  </a>
 </div><!-- /#page-home -->
 
 
@@ -451,11 +456,6 @@
     <svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
     Back to home
   </button>
-  <a class="survey-banner" id="survey-link" href="#" target="_blank" rel="noopener">
-    <svg viewBox="0 0 24 24"><path d="M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-7 14H7v-2h5v2zm5-4H7v-2h10v2zm0-4H7V7h10v2z"/></svg>
-    <span class="survey-label">Survey</span>
-    Complete feedback form for this condition
-  </a>
 </div>
 
 <!-- Page header -->
@@ -629,16 +629,10 @@ function applyConditionUI(cond) {
     scorePanel.dataset.cond  = cond;
     badgeLabel.style.display = cond === "C" ? "" : "none";
     const panelLabel = document.getElementById("score-panel-label");
-    const rowLlm      = scorePanel.querySelector(".row-llm");
-    const rowCombined = scorePanel.querySelector(".row-combined");
     if (cond === "B") {
       if (panelLabel) panelLabel.textContent = "EOS scoring";
-      if (rowLlm)      rowLlm.style.display      = "none";
-      if (rowCombined) rowCombined.style.display  = "none";
     } else {
       if (panelLabel) panelLabel.textContent = "Ensemble scoring";
-      if (rowLlm)      rowLlm.style.display      = "";
-      if (rowCombined) rowCombined.style.display  = "";
     }
   } else {
     scorePanel.classList.remove("visible");
@@ -1075,13 +1069,6 @@ document.getElementById("cfg-vad").addEventListener("input", (e) => {
 });
 
 // ── Page routing ──────────────────────────────────────────────────────────────
-// Survey URLs — replace placeholders with your actual Microsoft Forms links.
-const SURVEY_URLS = {
-  A: "https://forms.office.com/PLACEHOLDER_CONDITION_A",
-  B: "https://forms.office.com/PLACEHOLDER_CONDITION_B",
-  C: "https://forms.office.com/PLACEHOLDER_CONDITION_C",
-};
-
 function showPage(id) {
   document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
   document.getElementById(id).classList.add("active");
@@ -1089,8 +1076,6 @@ function showPage(id) {
 
 function enterSession(condition) {
   sendCondition(condition);
-  const link = document.getElementById("survey-link");
-  if (link) link.href = SURVEY_URLS[condition] || "#";
   showPage("page-session");
   window.scrollTo(0, 0);
 }
