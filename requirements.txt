@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 groq
-faster-whisper
 torch
 av
 numpy
