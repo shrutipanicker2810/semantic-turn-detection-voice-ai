@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 groq
 packaging
 numpy<2
