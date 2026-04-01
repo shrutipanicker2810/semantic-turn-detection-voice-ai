@@ -629,10 +629,16 @@ function applyConditionUI(cond) {
     scorePanel.dataset.cond  = cond;
     badgeLabel.style.display = cond === "C" ? "" : "none";
     const panelLabel = document.getElementById("score-panel-label");
+    const rowLlm      = scorePanel.querySelector(".row-llm");
+    const rowCombined = scorePanel.querySelector(".row-combined");
     if (cond === "B") {
       if (panelLabel) panelLabel.textContent = "EOS scoring";
+      if (rowLlm)      rowLlm.style.display      = "none";
+      if (rowCombined) rowCombined.style.display  = "none";
     } else {
       if (panelLabel) panelLabel.textContent = "Ensemble scoring";
+      if (rowLlm)      rowLlm.style.display      = "";
+      if (rowCombined) rowCombined.style.display  = "";
     }
   } else {
     scorePanel.classList.remove("visible");
