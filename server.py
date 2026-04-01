@@ -15,7 +15,6 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from groq import AsyncGroq
-from faster_whisper import WhisperModel
 
 
 # Logging 
@@ -26,7 +25,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-for noisy in ("httpx", "httpcore", "faster_whisper", "av", "groq"):
+for noisy in ("httpx", "httpcore", "av", "groq"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 
@@ -34,16 +33,7 @@ logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 ## Configuration 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 RESPONSE_MODEL = "llama-3.3-70b-versatile"
-
-# "groq"  - Groq Whisper Large V3 Turbo (~300ms, best for accented English)
-# "local" - faster-whisper on CPU (~2-4s)
-TRANSCRIPTION_BACKEND = "groq"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
-
-# Local Whisper settings - only loaded when TRANSCRIPTION_BACKEND="local" (fallback)
-WHISPER_MODEL_SIZE = "medium"
-WHISPER_DEVICE = "cpu"
-WHISPER_COMPUTE = "int8"
 
 VAD_SILENCE_THRESHOLD_S = 1.0       # seconds of silence that ends a turn
                                     # Lowered from 1.5s: noise floor is clean (VAD ~0.000–0.018)
@@ -141,7 +131,6 @@ groq_client: AsyncGroq | None = None
 ## Model container 
 class Models:
     vad_model = None  # Silero VAD torch module
-    whisper   = None  # faster-whisper WhisperModel (local backend only)
 
 
 ## Per-connection state
@@ -462,28 +451,6 @@ def compute_vad_prob(pcm: np.ndarray, state: "ConnectionState | None" = None) ->
     return result
 
 
-## Local transcription
-def _transcribe_local(pcm_frames: list[np.ndarray]) -> str:
-    """Concatenates PCM frames and transcribes with faster-whisper on CPU."""
-    pcm = np.concatenate(pcm_frames).astype(np.float32)
-    t0  = time.time()
-
-    segs, _ = Models.whisper.transcribe(
-        pcm,
-        language="en",
-        beam_size=3,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 200},
-        condition_on_previous_text=False,
-        temperature=0.0,
-    )
-
-    result = " ".join(s.text.strip() for s in segs).strip()
-    log.info("Local transcription: %.2fs → %s", time.time() - t0, result[:80])
-    return result
-
-
-
 ## Speculative transcription (Condition A)
 async def _run_speculative_transcription(state: "ConnectionState") -> None:
     """
@@ -530,12 +497,10 @@ async def _run_onset_transcription(state: "ConnectionState") -> None:
     Cancelled automatically by reset_turn() or when speech resumes.
     """
     try:
-        # Wait for the silence window to stabilise before transcribing.
-        # Half the silence threshold (0.5s) is sufficient to ensure the final
-        # words have landed in webm_session_buf, while giving the Groq call
-        # an extra 0.5s head start — pushing onset completion to δ_t ≈ 1.5s
-        # instead of 2.0s and leaving more budget for ensemble scoring before
-        # the 4.0s hard cap.
+        # Wait half the silence threshold before transcribing. This ensures the
+        # speaker's final words have landed in webm_session_buf while giving the
+        # Groq call a head start, so the onset transcript is ready earlier and
+        # the ensemble has more time to score before the 4.0s hard cap.
         await asyncio.sleep(VAD_SILENCE_THRESHOLD_S / 2)
         result = await transcribe_utterance(
             list(state.pcm_chunks),
@@ -598,7 +563,7 @@ def _strip_prefix_fuzzy(full_text: str, prev_text: str) -> str:
     return full_text
 
 
-## Transcription dispatcher 
+## Transcription dispatcher
 async def transcribe_utterance(
     pcm_frames: list[np.ndarray],
     raw_chunks: list[bytes],
@@ -606,70 +571,59 @@ async def transcribe_utterance(
     final: bool = False,
 ) -> str:
     """
-    Routes the utterance to Groq Whisper for transcription.
+    Transcribes the current utterance via Groq Whisper.
 
-    Always sends the full webm_session_buf — Chrome/Windows clusters are not
-    self-contained so offset slices produce invalid WebM. To isolate the current
-    turn's text, we strip any prefix that matches state.prev_transcript (the
-    cumulative transcript of all previous turns in this session).
+    Always sends the full webm_session_buf rather than a per-turn slice —
+    Chrome WebM clusters are not self-contained and slicing from an offset
+    produces invalid input. The current turn's text is isolated by stripping
+    the cumulative prev_transcript prefix using fuzzy matching.
 
-    Falls back gracefully if Groq fails and local Whisper is not loaded.
-    Returns an empty string if no frames or no audio bytes are available.
-    If state is provided, records latency in state.latency["transcription"].
+    Returns an empty string if no audio frames are available or the Groq call fails.
+    Records transcription latency in state.latency["transcription"] if state is provided.
     """
     if not pcm_frames:
         return ""
 
     t0 = time.monotonic()
 
-    if TRANSCRIPTION_BACKEND == "groq":
-        try:
-            webm_bytes = (
-                state.webm_session_buf
-                if state is not None and state.webm_session_buf
-                else b"".join(raw_chunks)
-            )
+    try:
+        webm_bytes = (
+            state.webm_session_buf
+            if state is not None and state.webm_session_buf
+            else b"".join(raw_chunks)
+        )
 
-            if not webm_bytes:
-                log.warning("Empty webm buffer — skipping transcription.")
-                return ""
+        if not webm_bytes:
+            log.warning("Empty webm buffer — skipping transcription.")
+            return ""
 
-            transcription = await groq_client.audio.transcriptions.create(
-                file=("audio.webm", webm_bytes, "audio/webm"),
-                model=GROQ_WHISPER_MODEL,
-                language="en",
-                prompt=(
-                    "The speaker may have a non-native English accent. "
-                    "Transcribe accurately including all words."
-                ),
-            )
-            full_text = transcription.text.strip()
+        transcription = await groq_client.audio.transcriptions.create(
+            file=("audio.webm", webm_bytes, "audio/webm"),
+            model=GROQ_WHISPER_MODEL,
+            language="en",
+            prompt=(
+                "The speaker may have a non-native English accent. "
+                "Transcribe accurately including all words."
+            ),
+        )
+        full_text = transcription.text.strip()
 
-            if state is not None:
-                state.last_full_transcript = full_text
+        if state is not None:
+            state.last_full_transcript = full_text
 
-            if state is not None and state.prev_transcript:
-                result = _strip_prefix_fuzzy(full_text, state.prev_transcript.strip())
-            else:
-                result = full_text
+        if state is not None and state.prev_transcript:
+            result = _strip_prefix_fuzzy(full_text, state.prev_transcript.strip())
+        else:
+            result = full_text
 
-            if state is not None:
-                state.latency["transcription"].append(_ms(t0))
-            log.info("Groq transcription: %.2fs → %s", (time.monotonic() - t0), result[:80])
-            return result
+        if state is not None:
+            state.latency["transcription"].append(_ms(t0))
+        log.info("Groq transcription: %.2fs → %s", (time.monotonic() - t0), result[:80])
+        return result
 
-        except Exception as exc:
-            log.warning("Groq transcription failed (%s) — falling back.", exc)
-
-    # Local fallback — also primary path when TRANSCRIPTION_BACKEND="local"
-    if Models.whisper is None:
-        log.warning("Local Whisper not loaded — returning empty.")
+    except Exception as exc:
+        log.warning("Groq transcription failed: %s — returning empty.", exc)
         return ""
-
-    result = await asyncio.to_thread(_transcribe_local, pcm_frames)
-    if state is not None:
-        state.latency["transcription"].append(_ms(t0))
-    return result
 
 ## WebSocket send helper
 async def ws_send(ws: WebSocket, msg: dict) -> None:
@@ -1309,16 +1263,15 @@ async def fire_turn(
         log.info("fire_turn: pipeline complete, warmup=5 applied.")
 
 
-## Model loading 
+## Model loading
 def load_models() -> None:
-    """Loads Silero VAD and (optionally) faster-whisper. Runs once at startup."""
+    """Initialises the Groq client and loads Silero VAD. Runs once at startup."""
     global groq_client
 
-    if TRANSCRIPTION_BACKEND == "groq" and not GROQ_API_KEY:
+    if not GROQ_API_KEY:
         log.warning(
-            "GROQ_API_KEY is not set — Groq backend will fail at runtime. "
-            "Set the environment variable and restart, or switch "
-            "TRANSCRIPTION_BACKEND to 'local'."
+            "GROQ_API_KEY is not set — transcription and scoring will fail at runtime. "
+            "Set the environment variable and restart."
         )
 
     if GROQ_API_KEY:
@@ -1334,21 +1287,6 @@ def load_models() -> None:
         trust_repo=True,
     )
     Models.vad_model.eval()
-
-    if TRANSCRIPTION_BACKEND == "local":
-        log.info("Loading faster-whisper (%s / %s) …", WHISPER_MODEL_SIZE, WHISPER_COMPUTE)
-        cpu_threads = max(4, os.cpu_count() or 4)
-        Models.whisper = WhisperModel(
-            WHISPER_MODEL_SIZE,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE,
-            cpu_threads=cpu_threads,
-            num_workers=1,
-        )
-        log.info("Whisper loaded — using %d CPU threads.", cpu_threads)
-    else:
-        log.info("Transcription backend: Groq %s — local Whisper not loaded.", GROQ_WHISPER_MODEL)
-
     log.info("All models ready.")
 
 
@@ -1915,4 +1853,5 @@ async def websocket_endpoint(ws: WebSocket):
 
 ## Entry point
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
