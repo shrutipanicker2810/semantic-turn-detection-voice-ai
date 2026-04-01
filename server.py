@@ -1288,7 +1288,7 @@ def load_models() -> None:
         model_path.parent.mkdir(parents=True, exist_ok=True)
         log.info("Downloading Silero VAD model weights …")
         torch.hub.download_url_to_file(
-            "https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.jit",
+            "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.jit",
             str(model_path),
         )
     Models.vad_model = torch.jit.load(str(model_path), map_location="cpu")
