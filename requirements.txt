@@ -1,8 +1,8 @@
 fastapi
 uvicorn
 groq
+numpy<2
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.2.2+cpu
 torchaudio==2.2.2+cpu
 av
-numpy
