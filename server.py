@@ -1278,8 +1278,13 @@ def load_models() -> None:
         log.info("AsyncGroq client initialised.")
 
     log.info("Loading Silero VAD …")
-    from silero_vad import load_silero_vad
-    Models.vad_model = load_silero_vad()
+    Models.vad_model, _ = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        force_reload=False,
+        onnx=False,
+        trust_repo=True,
+    )
     Models.vad_model.eval()
     log.info("All models ready.")
 
