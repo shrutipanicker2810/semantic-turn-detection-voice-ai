@@ -33,6 +33,7 @@ logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 ## Configuration 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 RESPONSE_MODEL = "llama-3.3-70b-versatile"
+
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 VAD_SILENCE_THRESHOLD_S = 1.0       # seconds of silence that ends a turn
@@ -497,9 +498,7 @@ async def _run_onset_transcription(state: "ConnectionState") -> None:
     Cancelled automatically by reset_turn() or when speech resumes.
     """
     try:
-        # Wait half the silence threshold before transcribing — enough for the
-        # speaker's final words to land in webm_session_buf while giving the
-        # Groq call a head start before the ensemble needs the result.
+        # Wait for the silence window to stabilise before transcribing.
         await asyncio.sleep(VAD_SILENCE_THRESHOLD_S / 2)
         result = await transcribe_utterance(
             list(state.pcm_chunks),
@@ -1279,13 +1278,8 @@ def load_models() -> None:
         log.info("AsyncGroq client initialised.")
 
     log.info("Loading Silero VAD …")
-    Models.vad_model, _ = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
-        force_reload=False,
-        onnx=True,
-        trust_repo=True,
-    )
+    from silero_vad import load_silero_vad
+    Models.vad_model = load_silero_vad()
     Models.vad_model.eval()
     log.info("All models ready.")
 

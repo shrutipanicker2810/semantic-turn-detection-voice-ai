@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 groq
+silero-vad
 packaging
 numpy<2
 --extra-index-url https://download.pytorch.org/whl/cpu
