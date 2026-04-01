@@ -116,13 +116,20 @@ EARLY_CLASSIFY_EVERY_N_CHUNKS: int = 2
 # How many consecutive checkpoints must agree before we call the label "stable".
 EARLY_CLASSIFY_STABILITY_N: int = 2
 
+# Minimum wall-clock gap between successive Groq Whisper calls from
+# early_classify_checkpoint. At 20 RPM the budget is one call every 3s;
+# 2.5s leaves a small safety margin without sacrificing classification
+# freshness. Speculative and fire_turn calls bypass this gate — they are
+# counted but not throttled because they are latency-critical.
+MIN_WHISPER_INTERVAL_S: float = 2.5
+
 # ── Opening prompt ─────────────────────────────────────────────────────────────
 # Seeded into conversation history on connect. Displayed as static text in the UI.
 # No TTS is triggered on connection — participant reads it and clicks the mic.
 OPENING_PROMPT = (
     "Hi, I'm here to help you think through a decision. "
-    "What's a decision you're currently weighing — it could be about a course, "
-    "a project direction, or anything you've been going back and forth on?"
+    "What's something you've been going back and forth on lately — "
+    "it could be anything: a career choice, a purchase, a personal situation, a project direction, anything at all."
 )
 
 
@@ -167,10 +174,20 @@ class ConnectionState:
         # the full buffer to Groq — slicing produces invalid WebM.
         self.webm_session_buf: bytes = b""
 
+        # Accumulation buffer for chunks arriving before the EBML magic header.
+        # Chrome occasionally splits the init segment across two chunks, so we
+        # concatenate and search for magic bytes in the joined data. Capped at 64 KB.
+        self._pre_header_buf: bytes = b""
+
         # Transcript from the previous completed turn. Used to strip already-seen
         # text from the full-buffer transcription so partial/final results only
         # contain the current turn's words.
         self.prev_transcript: str = ""
+
+        # Raw full-session transcript from last Groq call, before prefix-stripping.
+        # Used by fire_turn to update prev_transcript so it stays anchored to
+        # Whisper's actual output rather than the stripped result.
+        self.last_full_transcript: str = ""
 
         # Timing and flow-control
         self.silence_start: float | None = None  # monotonic time when silence began
@@ -208,8 +225,21 @@ class ConnectionState:
         # Speculative transcription (Condition A): a background asyncio.Task
         # started at SPECULATIVE_TRANSCRIBE_AT_S into silence. fire_turn() uses
         # its result instead of starting a fresh Groq call, saving ~1.3s.
-        self._speculative_task:       "asyncio.Task | None" = None
-        self._speculative_transcript: str                   = ""
+        self._speculative_task:          "asyncio.Task | None" = None
+        self._speculative_transcript:    str                   = ""
+        self._speculative_transcript_t:  float                 = 0.0   # monotonic time when result landed
+        self._speculative_silence_start: "float | None"        = None  # silence_start at task launch time
+
+        # Silence-onset transcription (Conditions B/C): launched on the very
+        # first silence chunk (δ_t=0) against the complete utterance buffer.
+        # Unlike the speculative call (which fires mid-utterance at 0.5s
+        # silence), this call captures the full sentence including any words
+        # spoken right up to the pause. The ensemble scorer reads from this
+        # result rather than the speculative transcript, avoiding the truncated-
+        # partial problem where Groq returns a mid-sentence cut because audio
+        # was still arriving when the speculative call was sent.
+        self._onset_task:       "asyncio.Task | None" = None
+        self._onset_transcript: str                   = ""
 
         # Non-blocking ensemble task (Conditions B/C): runs should_fire_ensemble
         # as a background task so the WS loop is never blocked waiting for
@@ -217,6 +247,20 @@ class ConnectionState:
         self._ensemble_task:          "asyncio.Task | None" = None
         self._ensemble_partial:       str                   = ""
         self._ensemble_delta_t:       float                 = 0.0
+
+        # Dedup cache: (partial_text, silence_bucket) of the last ensemble task
+        # that was launched. Prevents re-launching on identical (text, pause)
+        # pairs, but allows rescoring when the same transcript is seen at a
+        # meaningfully longer silence — every 0.5s bucket is a distinct entry.
+        # Using text-only dedup was too aggressive: EOS=0.0 at δ_t=2.0s would
+        # block all rescores even though δ_t=2.5s / 3.0s carry new signal.
+        self._last_scored_partial: "tuple[str, float]" = ("", -1.0)
+
+        # Groq Whisper rate gate: monotonic timestamp of the last successful
+        # call. Used by early_classify_checkpoint to skip transcription calls
+        # that would arrive within MIN_WHISPER_INTERVAL_S of the previous one,
+        # protecting the 20 RPM free-tier budget during long Condition C turns.
+        self._last_whisper_t: float = 0.0
 
         # Incremental VAD decode: tracks the PCM length after the last full
         # decode so we can slice only the newly-appended tail for VAD scoring
@@ -277,15 +321,27 @@ class ConnectionState:
         # Cancel any in-flight speculative transcription task and clear result.
         if self._speculative_task is not None and not self._speculative_task.done():
             self._speculative_task.cancel()
-        self._speculative_task       = None
-        self._speculative_transcript = ""
+        self._speculative_task          = None
+        self._speculative_transcript    = ""
+        self._speculative_transcript_t  = 0.0
+        self._speculative_silence_start = None
+
+        # Cancel any in-flight silence-onset transcription task.
+        if self._onset_task is not None and not self._onset_task.done():
+            self._onset_task.cancel()
+        self._onset_task       = None
+        self._onset_transcript = ""
 
         # Cancel any in-flight ensemble scoring task.
         if self._ensemble_task is not None and not self._ensemble_task.done():
             self._ensemble_task.cancel()
-        self._ensemble_task    = None
-        self._ensemble_partial = ""
-        self._ensemble_delta_t = 0.0
+        self._ensemble_task        = None
+        self._ensemble_partial     = ""
+        self._ensemble_delta_t     = 0.0
+        self._last_scored_partial  = ("", -1.0)
+        # _last_whisper_t is intentionally NOT reset — the rate gate spans
+        # turn boundaries to prevent two calls firing back-to-back at a turn
+        # transition (fire_turn's final call + next turn's first checkpoint).
 
         # Reset Silero RNN hidden state so residual speech probability from the
         # previous turn does not bias VAD at the start of the next turn.
@@ -298,6 +354,7 @@ class ConnectionState:
         # Reset incremental decode offset so the next turn slices from a
         # fresh baseline rather than a stale position in a longer buffer.
         self._last_decoded_pcm_len = 0
+        self._pre_header_buf = b""
 
         # prev_transcript is NOT reset here — it is updated after each completed
         # turn so the next transcription can strip already-seen text.
@@ -445,12 +502,48 @@ async def _run_speculative_transcription(state: "ConnectionState") -> None:
             state,
         )
         state._speculative_transcript = result or ""
+        state._speculative_transcript_t = time.monotonic()
         log.info("Speculative transcription complete: %s", state._speculative_transcript[:80])
     except asyncio.CancelledError:
         log.debug("Speculative transcription task cancelled.")
     except Exception as exc:
         log.warning("Speculative transcription error: %s", exc)
         state._speculative_transcript = ""
+
+
+## Silence-onset transcription (Conditions B/C)
+async def _run_onset_transcription(state: "ConnectionState") -> None:
+    """
+    Launched on the first silence chunk (δ_t=0) for Conditions B and C.
+
+    Waits VAD_SILENCE_THRESHOLD_S before calling Groq Whisper, ensuring the
+    webm_session_buf has accumulated at least 1s of confirmed silence before
+    the transcription request is sent. This prevents truncated results on fast
+    Groq days: without the wait, the Groq call can complete in ~0.6s, capturing
+    a buffer that is still missing the speaker's final words (which arrived in
+    silence chunks 1–3 after the onset task launched).
+
+    The wait adds no net latency to the ensemble pipeline — the result still
+    lands well before the first ensemble task needs it at δ_t ≈ 1.0–1.5s,
+    and the task runs concurrently with the silence wait in the WS loop.
+
+    Cancelled automatically by reset_turn() or when speech resumes.
+    """
+    try:
+        # Wait for the silence window to stabilise before transcribing.
+        await asyncio.sleep(VAD_SILENCE_THRESHOLD_S)
+        result = await transcribe_utterance(
+            list(state.pcm_chunks),
+            list(state.raw_chunks),
+            state,
+        )
+        state._onset_transcript = result or ""
+        log.info("Onset transcription complete: %s", state._onset_transcript[:80])
+    except asyncio.CancelledError:
+        log.debug("Onset transcription task cancelled.")
+    except Exception as exc:
+        log.warning("Onset transcription error: %s", exc)
+        state._onset_transcript = ""
 
 
 ## Fuzzy prefix stripper
@@ -470,13 +563,16 @@ def _strip_prefix_fuzzy(full_text: str, prev_text: str) -> str:
     if not prev_words:
         return full_text
 
-    window_size = min(5, len(prev_words))
+    window_size = min(10, len(prev_words))
     tail = prev_words[-window_size:]
+    tail_clean = [w.strip(".,!?;:\"\'") for w in tail]
 
+    # Scan right-to-left so we find the rightmost (latest) occurrence of the
+    # previous tail in full_text. Left-to-right stops at the first match, which
+    # can be a false positive when the same phrase recurs across turns.
     best_end = -1
-    for i in range(len(full_words) - window_size + 1):
+    for i in range(len(full_words) - window_size, -1, -1):
         candidate = [w.lower().strip(".,!?;:\"\'") for w in full_words[i:i + window_size]]
-        tail_clean = [w.strip(".,!?;:\"\'") for w in tail]
         matches = sum(a == b for a, b in zip(candidate, tail_clean))
         if matches >= max(1, window_size - 1):
             best_end = i + window_size
@@ -544,9 +640,9 @@ async def transcribe_utterance(
             )
             full_text = transcription.text.strip()
 
-            # Strip the previous turns' text to isolate the current turn.
-            # Groq re-transcribes the full session buffer each call, so the
-            # result always starts with everything spoken so far.
+            if state is not None:
+                state.last_full_transcript = full_text
+
             if state is not None and state.prev_transcript:
                 result = _strip_prefix_fuzzy(full_text, state.prev_transcript.strip())
             else:
@@ -583,35 +679,51 @@ async def ws_send(ws: WebSocket, msg: dict) -> None:
 
 async def score_eos(transcript: str, state: "ConnectionState | None" = None) -> float:
     """
-    Condition B + C: Estimates syntactic turn-completion probability using the
+    Condition B + C: Estimates syntactic end-of-sentence probability using the
     Groq LLM as a lightweight EOS scorer.
 
-    Asks the model to rate on a 0-1 scale whether the transcript represents a
-    complete thought. Returns the parsed float, or 0.5 on parse failure.
+    Scores ONLY grammatical/syntactic completeness — whether the utterance forms
+    a well-formed sentence that could stand alone. Pragmatic completeness (did the
+    speaker achieve their conversational goal?) is intentionally excluded here;
+    that is handled by score_llm_turn in Condition C. Keeping these concerns
+    separated prevents the EOS scorer from holding on utterances like "Hi, I need
+    help deciding between two project topics." which are syntactically complete
+    sentences even though the conversation has further to go.
+
+    Returns the parsed float in [0, 1], or 0.5 on parse failure.
     If state is provided, records latency in state.latency["eos_scorer"].
     """
     if not transcript.strip():
         return 0.0
     try:
         t0 = time.monotonic()
-        response = await groq_client.chat.completions.create(
-            model=RESPONSE_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a turn-taking classifier. "
-                        "Given a speech transcript, output ONLY a single float between 0.0 and 1.0 "
-                        "representing the probability that the speaker has completed their turn. "
-                        "1.0 = syntactically and pragmatically complete. "
-                        "0.0 = clearly mid-sentence or mid-thought. "
-                        "Output only the number, nothing else."
-                    ),
-                },
-                {"role": "user", "content": f"Transcript: {transcript}"},
-            ],
-            max_tokens=5,
-            temperature=0.0,
+        response = await asyncio.wait_for(
+            groq_client.chat.completions.create(
+                model=RESPONSE_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a syntactic end-of-sentence classifier for a speech recognition system. "
+                            "Given a speech transcript, output ONLY a single float between 0.0 and 1.0 "
+                            "representing the probability that the transcript is a grammatically complete, "
+                            "well-formed sentence or utterance that ends at a natural syntactic boundary.\n\n"
+                            "Score ONLY syntax and grammar — not whether the speaker has finished their "
+                            "conversational purpose. A sentence can be syntactically complete even if more "
+                            "context is expected to follow in the conversation.\n\n"
+                            "1.0 = clearly ends at a natural syntactic boundary (complete sentence, "
+                            "complete question, complete clause with no dangling conjunction or open phrase).\n"
+                            "0.0 = clearly mid-sentence: trailing conjunction (and, but, so, because), "
+                            "incomplete clause, or abruptly cut-off mid-phrase.\n"
+                            "Output only the number, nothing else."
+                        ),
+                    },
+                    {"role": "user", "content": f"Transcript: {transcript}"},
+                ],
+                max_tokens=5,
+                temperature=0.0,
+            ),
+            timeout=5.0,
         )
         raw = response.choices[0].message.content.strip()
         score = float(raw)
@@ -648,28 +760,31 @@ async def classify_task(
             f"{m['role'].upper()}: {m['content'][:100]}"
             for m in conversation_history[-4:]
         )
-        response = await groq_client.chat.completions.create(
-            model=RESPONSE_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a turn-taking classifier for a voice AI system. "
-                        "Classify the user's utterance into exactly one of these three types:\n"
-                        "  transactional — closed question or command expecting a direct answer\n"
-                        "  informational — factual statement or explanation\n"
-                        "  reflective    — thinking out loud, deliberating, open-ended\n\n"
-                        "Consider the conversation context. "
-                        "Output ONLY one word: transactional, informational, or reflective."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Context:\n{history_snippet}\n\nUtterance: {transcript}",
-                },
-            ],
-            max_tokens=5,
-            temperature=0.0,
+        response = await asyncio.wait_for(
+            groq_client.chat.completions.create(
+                model=RESPONSE_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a turn-taking classifier for a voice AI system. "
+                            "Classify the user's utterance into exactly one of these three types:\n"
+                            "  transactional — closed question or command expecting a direct answer\n"
+                            "  informational — factual statement or explanation\n"
+                            "  reflective    — thinking out loud, deliberating, open-ended\n\n"
+                            "Consider the conversation context. "
+                            "Output ONLY one word: transactional, informational, or reflective."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Context:\n{history_snippet}\n\nUtterance: {transcript}",
+                    },
+                ],
+                max_tokens=5,
+                temperature=0.0,
+            ),
+            timeout=5.0,
         )
         label = response.choices[0].message.content.strip().lower()
         if label not in ("transactional", "informational", "reflective"):
@@ -691,11 +806,12 @@ async def score_llm_turn(
     state: "ConnectionState | None" = None,
 ) -> float:
     """
-    Condition C: Scores turn completion using the transcript, pause duration,
-    task type, and conversation history.
+    Scores pragmatic turn completion for Condition C. Considers the full
+    utterance, pause duration, intent label, and recent conversation context.
 
-    Returns a float in [0, 1] representing probability the turn is complete.
-    If state is provided, records latency in state.latency["llm_scorer"].
+    Returns a float in [0, 1] representing the probability the speaker has
+    finished their turn. Returns 0.5 on parse failure or timeout.
+    Records latency in state.latency["llm_scorer"] if state is provided.
     """
     if not transcript.strip():
         return 0.0
@@ -705,32 +821,35 @@ async def score_llm_turn(
             f"{m['role'].upper()}: {m['content'][:100]}"
             for m in conversation_history[-4:]
         )
-        response = await groq_client.chat.completions.create(
-            model=RESPONSE_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a turn-taking scorer for a voice AI system. "
-                        "Given a transcript, pause duration, task type, and conversation context, "
-                        "output ONLY a single float between 0.0 and 1.0 representing the probability "
-                        "that the speaker has finished their turn and the AI should respond. "
-                        "1.0 = definitely done. 0.0 = definitely still speaking. "
-                        "Output only the number, nothing else."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Context:\n{history_snippet}\n\n"
-                        f"Utterance: {transcript}\n"
-                        f"Pause duration: {delta_t:.2f}s\n"
-                        f"Task type: {task_label}"
-                    ),
-                },
-            ],
-            max_tokens=5,
-            temperature=0.0,
+        response = await asyncio.wait_for(
+            groq_client.chat.completions.create(
+                model=RESPONSE_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a turn-taking scorer for a voice AI system. "
+                            "Given a transcript, pause duration, task type, and conversation context, "
+                            "output ONLY a single float between 0.0 and 1.0 representing the probability "
+                            "that the speaker has finished their turn and the AI should respond. "
+                            "1.0 = definitely done. 0.0 = definitely still speaking. "
+                            "Output only the number, nothing else."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Context:\n{history_snippet}\n\n"
+                            f"Utterance: {transcript}\n"
+                            f"Pause duration: {delta_t:.2f}s\n"
+                            f"Task type: {task_label}"
+                        ),
+                    },
+                ],
+                max_tokens=5,
+                temperature=0.0,
+            ),
+            timeout=5.0,
         )
         raw = response.choices[0].message.content.strip()
         score = float(raw)
@@ -746,17 +865,14 @@ async def score_llm_turn(
 
 async def early_classify_checkpoint(ws: "WebSocket", state: ConnectionState) -> None:
     """
-    Phase 2 — Early classification logging (Condition C only).
+    Classifies utterance intent during speech for Condition C.
 
-    Called every EARLY_CLASSIFY_EVERY_N_CHUNKS speech chunks while the user
-    is still speaking. Runs the task classifier on the partial transcript
-    accumulated so far and records:
-      - elapsed time since turn start (ms)
-      - the label at that checkpoint
-      - whether the label has been stable for EARLY_CLASSIFY_STABILITY_N checks
-
-    Sends a "task_label" message to the frontend whenever the label changes
-    so the badge updates live during speech, not only at silence time.
+    Runs every EARLY_CLASSIFY_EVERY_N_CHUNKS speech chunks, transcribing the
+    partial utterance and labelling it as transactional, informational, or
+    reflective. Once EARLY_CLASSIFY_STABILITY_N consecutive checkpoints agree
+    on the same label it is marked stable, and the dynamic silence threshold
+    is set accordingly. Sends a task_label message to the frontend on each
+    checkpoint so the badge updates live.
     """
     if state.condition != "C":
         return
@@ -765,12 +881,22 @@ async def early_classify_checkpoint(ws: "WebSocket", state: ConnectionState) -> 
 
     elapsed_s = time.monotonic() - state.turn_start_time
 
+    # Skip if a Whisper call completed too recently — enforces MIN_WHISPER_INTERVAL_S.
+    now_t = time.monotonic()
+    if (now_t - state._last_whisper_t) < MIN_WHISPER_INTERVAL_S:
+        log.debug(
+            "Early classify: rate gate — %.1fs since last Whisper call, skipping.",
+            now_t - state._last_whisper_t,
+        )
+        return
+
     try:
         partial = await transcribe_utterance(
             list(state.pcm_chunks),
             list(state.raw_chunks),
             state,
         )
+        state._last_whisper_t = time.monotonic()
     except Exception as exc:
         log.warning("Early classify transcription error: %s", exc)
         return
@@ -778,8 +904,7 @@ async def early_classify_checkpoint(ws: "WebSocket", state: ConnectionState) -> 
     if not partial:
         return
 
-    # Guard: if the turn was reset while we were awaiting transcription/classify,
-    # discard this result rather than writing a stale label into fresh state.
+    # Discard results that arrived after the turn was reset.
     if state.turn_start_time is None:
         log.debug("Early classify: turn reset while in flight — discarding result.")
         return
@@ -790,7 +915,6 @@ async def early_classify_checkpoint(ws: "WebSocket", state: ConnectionState) -> 
         log.debug("Early classify: turn reset while classifying — discarding result.")
         return
 
-    # Stability check: count how many of the last N checkpoints share this label
     recent_labels = [entry["label"] for entry in state.early_classify_times[-(EARLY_CLASSIFY_STABILITY_N - 1):]]
     recent_labels.append(label)
     stable = (
@@ -812,8 +936,6 @@ async def early_classify_checkpoint(ws: "WebSocket", state: ConnectionState) -> 
         elapsed_s * 1000, label, stable, partial[:60],
     )
 
-    # Always update task_label and push to frontend so the badge shows
-    # the current classification live during speech, not only at silence time.
     state.task_label = label
     await ws_send(ws, {
         "type":       "task_label",
@@ -837,35 +959,38 @@ async def should_fire_ensemble(
     state: ConnectionState,
 ) -> bool:
     """
-    Condition B + C: Decides whether to fire the turn based on the active condition.
+    Decides whether to fire the turn for Conditions B and C.
 
-    Condition B: EOS score alone must exceed ENSEMBLE_THRESHOLD.
-    Condition C: Runs task classifier + parallel EOS + LLM scorer.
-                 Combined weighted score must exceed ENSEMBLE_THRESHOLD.
-                 Also enforces the dynamic silence threshold for the task type.
+    Condition B: fires when the EOS score alone exceeds ENSEMBLE_THRESHOLD.
+    Condition C: classifies utterance intent, then runs EOS and LLM scorers in
+    parallel. The combined weighted score is evaluated against two tiers:
+      - combined >= HIGH_CONFIDENCE_THRESHOLD → fire immediately
+      - combined >= ENSEMBLE_THRESHOLD and delta_t >= dynamic threshold → fire
+      - otherwise → hold
     """
     if state.condition == "B":
         eos_score = await score_eos(transcript, state)
         decision  = eos_score >= ENSEMBLE_THRESHOLD
-        # Store scores so the WS loop can snapshot them for the frontend scoring panel.
         state.last_eos_score      = eos_score
-        state.last_llm_score      = 0.0   # LLM scorer not used in B
-        state.last_combined_score = eos_score  # combined == EOS for B
+        state.last_llm_score      = 0.0
+        state.last_combined_score = eos_score
         log.info("Condition B — EOS=%.3f threshold=%.2f fire=%s", eos_score, ENSEMBLE_THRESHOLD, decision)
         return decision
 
-    # Condition C
-    label = await classify_task(transcript, state.conversation_history, state)
-    state.task_label                = label
+    # Condition C — reuse a stable early-classify label when available.
+    # If no checkpoint has fired yet (short utterance), classify from scratch.
+    if state.task_label != "unknown":
+        label = state.task_label
+        log.info(
+            "Condition C — reusing early-classify label=%s (skipping re-classify)",
+            label,
+        )
+    else:
+        label = await classify_task(transcript, state.conversation_history, state)
+        state.task_label = label
     state.current_silence_threshold = DYNAMIC_THRESHOLDS.get(label, VAD_SILENCE_THRESHOLD_S)
 
-    # ── Two-tier firing decision ───────────────────────────────────────────────
-    # Always score — we need the combined value to decide which tier applies.
-    # The threshold check is moved AFTER scoring so high-confidence utterances
-    # can fire before the full dynamic window expires.
-    #
-    # Exception: if we haven't even hit the early-fire floor yet, skip scoring
-    # entirely — there isn't enough silence to warrant a response regardless.
+    # Skip scoring entirely if the minimum silence floor has not been reached.
     if delta_t < EARLY_FIRE_MIN_SILENCE_S:
         log.info(
             "Condition C — δ_t=%.2fs < early-fire floor=%.2fs — holding (no score)",
@@ -889,10 +1014,7 @@ async def should_fire_ensemble(
     state.last_llm_score      = llm_score
     state.last_combined_score = combined
 
-    # Tier 1 — high confidence: fire immediately, regardless of dynamic threshold.
-    # Applies to all task types: transactional fires at its own 0.8s floor anyway,
-    # so the meaningful savings are on informational (saves up to 0.8s) and
-    # reflective (saves up to 2.0s).
+    # Tier 1 — fire immediately when the combined score exceeds HIGH_CONFIDENCE_THRESHOLD.
     if combined >= HIGH_CONFIDENCE_THRESHOLD and delta_t >= EARLY_FIRE_MIN_SILENCE_S:
         decision = True
         log.info(
@@ -903,7 +1025,7 @@ async def should_fire_ensemble(
         )
         return decision
 
-    # Tier 2 — normal confidence: require the dynamic threshold to be met first.
+    # Tier 2 — require the dynamic silence threshold before approving at normal confidence.
     if delta_t < state.current_silence_threshold:
         log.info(
             "Condition C — label=%s EOS=%.3f LLM=%.3f combined=%.3f "
@@ -922,53 +1044,58 @@ async def should_fire_ensemble(
     return decision
 
 
-## LLM response generation 
+## LLM response generation
 async def generate_and_speak(ws: WebSocket, state: ConnectionState, transcript: str) -> None:
     """
     Appends the transcript to conversation history, calls the Groq LLM, and
-    sends the reply as a "response" message.
+    sends the reply as a "response" WebSocket message.
 
-    Does NOT manage state.processing or call reset_turn().
-    fire_turn() is the single owner of the processing lock and reset lifecycle;
-    this function is awaited inline by fire_turn(), not as a background task.
+    Does not manage state.processing or call reset_turn(). fire_turn() owns
+    the processing lock and awaits this function inline.
     """
     await ws_send(ws, {"type": "status", "text": "[PROCESSING] Generating response ..."})
 
-    # ── Task-label-aware response instruction (Condition C only) ──────────────
-    # Maps the classified utterance type to an explicit behavioural instruction
-    # appended to the system prompt. This prevents the LLM from defaulting to
-    # its advisor persona (ask a follow-up) when the user just wanted a direct
-    # answer. For Conditions A/B the label stays "unknown" and no instruction
-    # is injected, preserving the original behaviour.
+    # In Condition C, the classified intent label is used to inject a behavioural
+    # instruction into the system prompt so the LLM responds appropriately for the
+    # utterance type. In Conditions A/B the label is "unknown" and no instruction
+    # is injected.
     TASK_RESPONSE_INSTRUCTIONS: dict[str, str] = {
         "transactional": (
             "The user asked a direct, closed question. "
-            "Answer it in one sentence only. "
-            "Do NOT ask a follow-up question or connect it back to their decision."
+            "Answer it clearly and concisely in one sentence. "
+            "If the answer is directly relevant to a decision they appear to be working through, "
+            "you may briefly connect it — but do not force a follow-up question."
         ),
         "informational": (
-            "The user made a factual statement or gave an explanation. "
-            "Acknowledge it briefly, then ask one relevant probing question if appropriate."
+            "The user shared information or context about their situation. "
+            "Acknowledge what they said, then ask one focused follow-up question "
+            "that helps them think more deeply about the specific thing they just described. "
+            "Do not ask about aspects they haven't mentioned yet."
         ),
         "reflective": (
-            "The user is thinking out loud or deliberating. "
-            "Ask a single open-ended probing question to help them explore their reasoning further. "
-            "Do not rush to give an answer."
+            "The user is thinking out loud, weighing options, or deliberating. "
+            "Briefly acknowledge what you heard to show you followed their reasoning, "
+            "then ask one open-ended question that helps them examine an assumption "
+            "or explore a dimension they haven't fully considered. "
+            "Do not offer your own opinion or steer them toward a particular choice."
         ),
     }
     task_instruction = TASK_RESPONSE_INSTRUCTIONS.get(state.task_label, "")
 
     base_system_prompt = (
-        "You are a thoughtful academic advisor helping a graduate student "
-        "think through a decision they are facing. "
-        "Your role is to help them deliberate, not to give them answers. "
-        "Ask probing questions that draw out their reasoning. "
-        "When they are thinking out loud, wait for them to finish before responding — "
-        "do not rush them. "
-        "When they ask a direct factual question, answer it briefly and clearly. "
-        "Keep all responses concise and natural-sounding since they will be spoken aloud. "
-        "Never give lists — speak in natural sentences as you would in conversation. "
-        "Aim for 1-2 sentences unless a longer response is clearly needed."
+        "You are a thoughtful, neutral thinking partner helping someone work through a decision they are facing. "
+        "The topic could be anything — career, personal life, finances, projects, relationships, purchases, or anything else. "
+        "Your role is to help them deliberate and clarify their own thinking, not to give them answers or steer them toward a particular choice. "
+        "\n\n"
+        "Follow these rules strictly:\n"
+        "- If the user's message is a preamble or setup (they've introduced a topic but haven't described the actual decision or options yet), "
+        "respond with only a brief, natural acknowledgment and invite them to continue. "
+        "Do NOT ask probing questions until you have enough context to make them meaningful.\n"
+        "- If the user is thinking out loud, let them finish the thought before responding — ask one open-ended question.\n"
+        "- If the user asks a direct factual question, answer it briefly and clearly.\n"
+        "- Never give lists. Speak in natural sentences as you would in conversation.\n"
+        "- Keep all responses concise and natural-sounding since they will be spoken aloud.\n"
+        "- Aim for 1-2 sentences. Never exceed 3 sentences unless absolutely necessary."
     )
     system_prompt = (
         base_system_prompt + "\n\n" + task_instruction
@@ -1014,7 +1141,7 @@ async def generate_and_speak(ws: WebSocket, state: ConnectionState, transcript: 
         await ws_send(ws, {"type": "status", "text": f"[ERROR] Groq error: {exc}"})
 
 
-## Turn firing 
+## Turn firing
 async def fire_turn(
     ws: WebSocket,
     state: ConnectionState,
@@ -1022,23 +1149,21 @@ async def fire_turn(
     mid_speech: bool = False,
 ) -> None:
     """
-    Single-owner pipeline: lock → transcribe → log → LLM → release.
+    Executes the turn pipeline: acquire lock → transcribe → log → LLM → release.
 
-    processing=True is set immediately so the WS loop drops all audio during
-    the transcription await (previously reset_turn cleared it with no lock held,
-    causing a race where echo or next-turn audio accumulated incorrectly).
+    processing is set True immediately so the WebSocket loop drops incoming audio
+    during the pipeline. generate_and_speak() is awaited inline to avoid any race
+    between transcription and LLM completion. The finally block is the single
+    release point for the processing lock.
 
-    generate_and_speak() is awaited inline — not a background task — so there
-    is no race between transcription and LLM completion. The finally block is
-    the single exit point for the processing lock.
+    If prefetched_transcript is provided (speculative for Condition A, onset for
+    B/C) it is used directly, skipping the Groq transcription call. mid_speech
+    suppresses prev_transcript updates when the turn was forced by MAX_SPEECH_CHUNKS.
     """
-    # 1. Lock immediately.
     state.processing = True
 
-    # Reset Silero hidden state NOW, before any new audio arrives.
-    # Doing it here (rather than in reset_turn's finally) means the very first
-    # silent chunk after this turn is scored with a clean RNN state, not with
-    # the momentum built up from 70+ speech chunks at prob=1.000.
+    # Reset Silero hidden state immediately so the first silent chunk after this
+    # turn is scored without residual speech momentum from the utterance.
     if Models.vad_model is not None:
         try:
             Models.vad_model.reset_states()
@@ -1057,21 +1182,24 @@ async def fire_turn(
         if state.silence_start is not None else None
     )
 
-    # Clear audio buffers; processing stays True.
+    # Snapshot latency before reset_turn clears it. Any background transcription
+    # or scoring calls that completed during the silence window have already
+    # recorded their measurements here; they would be lost otherwise.
+    pre_reset_latency: "dict[str, list[float]]" = {
+        k: list(v) for k, v in state.latency.items()
+    }
+
     state.reset_turn()
 
     try:
         await ws_send(ws, {"type": "status", "text": "[TRANSCRIBING] ..."})
 
-        # 2. Transcribe.
         if prefetched_transcript is not None:
             final = prefetched_transcript
         else:
             final = await transcribe_utterance(frames, raw, state, final=True)
 
-        # Abort silently if the client disconnected while we were transcribing.
-        # This prevents stale LLM calls and prev_transcript updates that would
-        # corrupt the next session's prefix stripping.
+        # Abort if the client disconnected while transcription was in flight.
         if not state.connected:
             log.info("fire_turn: client disconnected during transcription — aborting.")
             return
@@ -1081,7 +1209,6 @@ async def fire_turn(
             await ws_send(ws, {"type": "status", "text": "[READY] Click the mic and start speaking"})
             return
 
-        # 3. Update cumulative prev_transcript.
         if not mid_speech:
             if state.prev_transcript:
                 state.prev_transcript = (state.prev_transcript + " " + final).strip()
@@ -1091,7 +1218,6 @@ async def fire_turn(
         log.info("Final transcript: %s", final)
         await ws_send(ws, {"type": "transcript", "text": final})
 
-        # 4. Log.
         first_stable = next(
             (e["elapsed_ms"] for e in early_times if e.get("stable")), None
         )
@@ -1105,7 +1231,12 @@ async def fire_turn(
                 "max_ms":  round(max(vals), 1),
             }
 
-        latency_snapshot = {k: _lat_summary(v) for k, v in state.latency.items()}
+        # Merge pre-reset measurements with any recorded inside fire_turn itself.
+        merged_latency = {
+            k: pre_reset_latency.get(k, []) + state.latency.get(k, [])
+            for k in state.latency
+        }
+        latency_snapshot = {k: _lat_summary(v) for k, v in merged_latency.items()}
 
         log_entry = {
             "timestamp":            time.time(),
@@ -1118,24 +1249,27 @@ async def fire_turn(
             "early_classify_times": early_times,
             "first_stable_ms":      first_stable,
             "chunk_count":          len(frames),
+            "prefetch_source":      (
+                "speculative" if state.condition == "A" and prefetched_transcript is not None
+                else "onset"  if state.condition in ("B", "C") and prefetched_transcript is not None
+                else "none"
+            ),
             "latency":              latency_snapshot,
         }
         state.turn_log.append(log_entry)
         log.info("Turn log entry: %s", json.dumps(log_entry))
 
-        # 5. Generate and speak — awaited inline, single lock owner.
         await generate_and_speak(ws, state, final)
 
     finally:
-        # Single exit point: release lock and apply warmup.
         state.processing = False
         state.warmup_skip = 5
         log.info("fire_turn: pipeline complete, warmup=5 applied.")
 
 
-## Model loading 
+## Model loading
 def load_models() -> None:
-    """Loads Silero VAD and (optionally) faster-whisper. Runs once at startup."""
+    """Initialises the Groq client, loads Silero VAD, and optionally loads faster-whisper."""
     global groq_client
 
     if TRANSCRIPTION_BACKEND == "groq" and not GROQ_API_KEY:
@@ -1176,10 +1310,10 @@ def load_models() -> None:
     log.info("All models ready.")
 
 
-## FastAPI app with lifespan
+## FastAPI app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Calls load_models() before the server accepts requests."""
+    """Runs load_models() before the server begins accepting requests."""
     load_models()
     yield
 
@@ -1188,7 +1322,7 @@ app = FastAPI(title="VAD Baseline", lifespan=lifespan)
 
 
 ## Session log export
-_last_session_log: list[dict] = []  # set by websocket_endpoint on disconnect
+_last_session_log: list[dict] = []  # populated on WebSocket disconnect
 
 
 @app.get("/session-log")
@@ -1278,12 +1412,11 @@ async def root():
     return HTMLResponse("<h1>index.html not found next to server.py</h1>")
 
 
-## WebSocket endpoint 
+## WebSocket endpoint
 async def _ping_loop(ws: WebSocket, state: "ConnectionState") -> None:
     """
-    Sends a WebSocket ping every 15 seconds to prevent the browser from
-    closing an idle connection (Chrome drops quiet WebSockets after ~30s).
-    Exits cleanly when state.connected is set to False.
+    Sends a WebSocket ping every 15 seconds to keep the connection alive.
+    Chrome closes idle WebSockets after ~30s of inactivity.
     """
     while state.connected:
         await asyncio.sleep(15)
@@ -1298,9 +1431,9 @@ async def _ping_loop(ws: WebSocket, state: "ConnectionState") -> None:
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     """
-    Entry point for each browser connection. Creates a ConnectionState instance
-    for the client, then runs the receive loop until the client disconnects.
-    A background ping loop keeps the connection alive through idle periods.
+    Main receive loop for each browser connection. Creates a ConnectionState
+    instance, seeds the opening prompt into conversation history, then processes
+    incoming binary audio and JSON control messages until the client disconnects.
     """
     await ws.accept()
     log.info("Client connected.")
@@ -1308,8 +1441,8 @@ async def websocket_endpoint(ws: WebSocket):
     state = ConnectionState()
     state.connected = True
 
-    # Seed the opening prompt into conversation history.
-    # No TTS is triggered — the prompt is shown as static text in the UI.
+    # Seed the opening prompt as the first assistant turn so the LLM has context
+    # from the start. No TTS is triggered — the participant reads it in the UI.
     state.conversation_history.append({"role": "assistant", "content": OPENING_PROMPT})
 
     await ws_send(ws, {"type": "status", "text": "[READY] Click the mic and start speaking"})
@@ -1326,7 +1459,7 @@ async def websocket_endpoint(ws: WebSocket):
             raw  = data.get("bytes")
             text = data.get("text")
 
-            # JSON control messages 
+            # JSON control messages
             if text:
                 try:
                     msg = json.loads(text)
@@ -1344,19 +1477,16 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
 
                 if msg.get("type") == "reset":
-                    # Sent by the frontend after TTS onend fires.
-                    # The Web Speech API can fire onend multiple times on long
-                    # utterances (internal TTS segmentation), causing spurious
-                    # resets that wipe audio mid-speech on the next turn.
-                    # Guard: if warmup or processing is already active from
-                    # fire_turn's own reset, ignore this duplicate reset entirely.
+                    # Sent by the frontend after TTS onend fires. The Web Speech API
+                    # can fire onend multiple times per utterance (Chrome segments long
+                    # responses internally), so duplicate resets are ignored when warmup
+                    # or a pipeline is already active, and when speech is in progress.
                     if state.warmup_skip > 0 or state.processing:
                         log.debug(
                             "Frontend reset ignored — warmup_skip=%d processing=%s",
                             state.warmup_skip, state.processing,
                         )
                     elif state.pcm_chunks:
-                        # User is already speaking — do not reset mid-speech.
                         log.debug("Frontend reset ignored — speech already in progress (%d chunks).", len(state.pcm_chunks))
                     else:
                         state.reset_turn(warmup=5)
@@ -1388,30 +1518,33 @@ async def websocket_endpoint(ws: WebSocket):
 
             now = time.monotonic()
 
-            # Accumulate raw chunks into the session buffer.
-            # Only start accumulating once we've seen the EBML magic header —
-            # chunks arriving before the header (e.g. continuation clusters from
-            # a previous MediaRecorder that arrived after reconnect) are discarded.
-            # This prevents headerless data from polluting the new session buffer
-            # and causing PyAV decode errors on all subsequent chunks.
+            # Buffer incoming audio, waiting for the EBML magic header before
+            # committing bytes to the session buffer. Pre-header chunks (e.g.
+            # continuation clusters from a stale MediaRecorder) are held in
+            # _pre_header_buf and discarded if the header never arrives.
             if not state.webm_session_buf:
-                if not raw.startswith(_WEBM_EBML_MAGIC):
-                    log.debug("Discarding pre-header chunk (%d bytes) — waiting for EBML magic.", len(raw))
+                state._pre_header_buf += raw
+                magic_pos = state._pre_header_buf.find(_WEBM_EBML_MAGIC)
+                if magic_pos == -1:
+                    if len(state._pre_header_buf) > 65536:
+                        log.warning("Pre-header buffer exceeded 64 KB — discarding.")
+                        state._pre_header_buf = b""
+                    else:
+                        log.debug("Buffering pre-header data (%d bytes) — waiting for EBML magic.", len(state._pre_header_buf))
                     continue
-                log.debug("EBML header received — starting new WebM session buffer.")
-            state.webm_session_buf += raw
+                state.webm_session_buf = state._pre_header_buf[magic_pos:]
+                state._pre_header_buf  = b""
+                log.debug("EBML header found at offset %d — session buffer started (%d bytes).", magic_pos, len(state.webm_session_buf))
+            else:
+                state.webm_session_buf += raw
 
             full_pcm = decode_to_pcm(state.webm_session_buf)
             if full_pcm is None:
                 log.debug("Chunk not decodable — skipping.")
                 continue
 
-            # Incremental VAD slice: take only the samples appended since the
-            # last decode rather than always taking the last N samples of the
-            # full buffer. This is O(1) regardless of session length and avoids
-            # PyAV resampler flush drift that causes the tail slice to land on
-            # slightly older audio after many turns (which shows as VAD=0.001
-            # while the user is actively speaking).
+            # Extract only the samples added by this chunk using the incremental
+            # decode offset. This avoids re-scoring the full growing buffer each chunk.
             samples_per_chunk = int(SAMPLE_RATE * CHUNK_MS / 1000)
             prev_len = state._last_decoded_pcm_len
             state._last_decoded_pcm_len = len(full_pcm)
@@ -1421,11 +1554,10 @@ async def websocket_endpoint(ws: WebSocket):
                 if len(pcm) > samples_per_chunk:
                     pcm = pcm[-samples_per_chunk:]
             else:
-                # First chunk of session or decode returned fewer samples —
-                # fall back to tail slice
+                # First chunk of the session, or the decoder returned fewer samples
+                # than last time — fall back to a tail slice.
                 pcm = full_pcm[-samples_per_chunk:] if len(full_pcm) > samples_per_chunk else full_pcm
 
-            # Score the chunk with Silero VAD
             prob      = compute_vad_prob(pcm, state)
             is_speech = prob > SPEECH_PROB_THRESHOLD
             log.info(
@@ -1434,20 +1566,28 @@ async def websocket_endpoint(ws: WebSocket):
             )
 
             if is_speech:
-                state.silence_start = None  # reset silence timer on any voiced chunk
+                state.silence_start = None
+
+                # If the onset task ran during a brief VAD dip but speech has resumed,
+                # its result covers only the audio up to the dip. Clear it so a fresh
+                # onset task fires against the complete utterance on the next silence.
+                if state._onset_task is not None:
+                    if not state._onset_task.done():
+                        state._onset_task.cancel()
+                    state._onset_task       = None
+                    state._onset_transcript = ""
+                    log.debug("Speech resumed — onset task cancelled/cleared for next silence window.")
 
                 if not state.pcm_chunks:
-                    # First voiced chunk — record turn start and prepend pre-speech buffer.
+                    # First voiced chunk — record turn start and prepend the pre-speech buffer.
                     state.turn_start_time = now
                     state.pcm_chunks.extend(state.pre_pcm_buf)
                     state.raw_chunks.extend(state.pre_raw_buf)
                     state.pre_pcm_buf.clear()
                     state.pre_raw_buf.clear()
 
-                    # Condition C: immediately reset the badge to unknown so the
-                    # previous turn's stale label is not shown while the new turn
-                    # is being classified. early_classify_checkpoint will update
-                    # it once the first partial transcript is ready.
+                    # Condition C: clear the task label badge immediately so the
+                    # previous turn's label is not shown while the new turn is classified.
                     if state.condition == "C":
                         await ws_send(ws, {
                             "type":            "task_label",
@@ -1464,12 +1604,8 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws_send(ws, {"type": "status", "text": f"[MIC] Listening ... ({count} chunks)"})
                 log.info("Speech chunk accumulated: total=%d", count)
 
-                # ── Early classification checkpoint (Phase 2, Condition C only) ──
-                # Note: `not state.processing` is intentionally omitted here.
-                # processing=True belongs to the current turn's fire_turn lock;
-                # by the time new speech chunks arrive it is always False.
-                # The real stale-turn guard is the `turn_start_time is None`
-                # check inside early_classify_checkpoint itself.
+                # Condition C: launch a classification checkpoint every N chunks.
+                # The stale-turn guard lives inside early_classify_checkpoint itself.
                 if (
                     state.condition == "C"
                     and count % EARLY_CLASSIFY_EVERY_N_CHUNKS == 0
@@ -1483,7 +1619,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             else:
                 if not state.pcm_chunks:
-                    # No speech yet — maintain the rolling pre-speech buffer.
+                    # No speech detected yet — maintain the rolling pre-speech buffer.
                     state.pre_pcm_buf.append(pcm)
                     state.pre_raw_buf.append(raw)
                     if len(state.pre_pcm_buf) > PRE_SPEECH_PAD:
@@ -1491,7 +1627,7 @@ async def websocket_endpoint(ws: WebSocket):
                         state.pre_raw_buf.pop(0)
                     continue
 
-                # Speech already detected — accumulate silence into the utterance
+                # Post-speech silence — accumulate the chunk and update the silence timer.
                 state.pcm_chunks.append(pcm)
                 state.raw_chunks.append(raw)
 
@@ -1504,9 +1640,8 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # ── Condition routing ──────────────────────────────────────────
                 if state.condition == "A":
-                    # Speculative transcription: kick off a Groq call at
-                    # SPECULATIVE_TRANSCRIBE_AT_S so the result is ready by the
-                    # time the silence threshold fires. Only launch once per turn.
+                    # Launch the speculative transcription task once, at SPECULATIVE_TRANSCRIBE_AT_S,
+                    # so the result overlaps the remaining silence wait.
                     if (
                         delta_t >= SPECULATIVE_TRANSCRIBE_AT_S
                         and state._speculative_task is None
@@ -1516,6 +1651,7 @@ async def websocket_endpoint(ws: WebSocket):
                             "Condition A — δ_t=%.2fs ≥ %.2fs — launching speculative transcription.",
                             delta_t, SPECULATIVE_TRANSCRIBE_AT_S,
                         )
+                        state._speculative_silence_start = state.silence_start
                         state._speculative_task = asyncio.create_task(
                             _run_speculative_transcription(state)
                         )
@@ -1525,10 +1661,8 @@ async def websocket_endpoint(ws: WebSocket):
                             "Condition A — silence %.2fs ≥ %.2fs — firing turn.",
                             delta_t, VAD_SILENCE_THRESHOLD_S,
                         )
-                        # Wait for speculative transcription using short poll intervals
-                        # so we can detect a disconnect and abort rather than
-                        # blocking the WS loop for up to 2s with wait_for().
-                        # Groq can take 1.5-2s on a slow day so give it 3s total.
+                        # Poll the speculative task at short intervals so a disconnect
+                        # can be detected without blocking the loop. Total budget: 3s.
                         prefetched: str | None = None
                         if state._speculative_task is not None:
                             if not state._speculative_task.done():
@@ -1544,119 +1678,154 @@ async def websocket_endpoint(ws: WebSocket):
                                         break
                                     await asyncio.sleep(0.05)
                             if state._speculative_transcript:
-                                prefetched = state._speculative_transcript
-                                log.info("Condition A — using speculative transcript: %s", prefetched[:80])
+                                # Only use the result if it belongs to the current silence window.
+                                # A result from a prior window (speech resumed since) covers an
+                                # incomplete buffer and must be discarded.
+                                same_window = (
+                                    state._speculative_silence_start is not None
+                                    and state.silence_start is not None
+                                    and state._speculative_silence_start == state.silence_start
+                                )
+                                if same_window:
+                                    prefetched = state._speculative_transcript
+                                    log.info(
+                                        "Condition A — using speculative transcript (age=%.1fs): %s",
+                                        time.monotonic() - state._speculative_transcript_t,
+                                        prefetched[:80],
+                                    )
+                                else:
+                                    log.warning(
+                                        "Condition A — speculative transcript is from a different silence window — discarding, fire_turn will re-transcribe."
+                                    )
 
                         if not state.connected:
                             log.info("Condition A — skipping fire_turn, client disconnected.")
                         else:
+                            buf_mb = len(state.webm_session_buf) / (1024 * 1024)
+                            if buf_mb > 2.0:
+                                log.warning(
+                                    "webm_session_buf is %.1f MB — Groq latency may degrade. Consider ending session soon.",
+                                    buf_mb,
+                                )
                             await fire_turn(ws, state, prefetched_transcript=prefetched)
 
                 else:
-                    # Hard cap — fire unconditionally regardless of ensemble score.
+                    # Conditions B/C — hard cap first, then ensemble scoring path.
                     if delta_t >= MAX_SILENCE_S:
                         log.info(
                             "Condition %s — silence hard cap %.2fs reached — firing turn.",
                             state.condition, delta_t,
                         )
+                        buf_mb = len(state.webm_session_buf) / (1024 * 1024)
+                        if buf_mb > 2.0:
+                            log.warning(
+                                "webm_session_buf is %.1f MB — Groq latency may degrade. Consider ending session soon.",
+                                buf_mb,
+                            )
                         await fire_turn(ws, state)
 
-                    elif delta_t >= VAD_SILENCE_THRESHOLD_S:
-                        # ── Transcription (non-blocking) ──────────────────────────
-                        # Never await transcription inline — it takes ~1.3s and
-                        # would suspend the WS loop, starving the ensemble task of
-                        # the chunks it needs to complete and be harvested.
-                        # Instead: launch transcription as a background task on
-                        # first silence chunk, harvest on completion.
-                        if state._speculative_task is None and state.pcm_chunks:
-                            state._speculative_task = asyncio.create_task(
-                                _run_speculative_transcription(state)
+                    else:
+                        # Launch the silence-onset transcription task once, at δ_t=0.
+                        if state._onset_task is None and state.pcm_chunks:
+                            log.info(
+                                "Condition %s — silence onset — launching onset transcription.",
+                                state.condition,
                             )
-                            log.debug("Condition %s — transcription task launched.", state.condition)
+                            state._onset_task = asyncio.create_task(
+                                _run_onset_transcription(state)
+                            )
 
-                        # Use cached partial if speculative already finished,
-                        # else use whatever we have from _cached_partial.
-                        if state._speculative_transcript:
-                            partial = state._speculative_transcript
-                            state._cached_partial     = partial
-                            state._cached_partial_t   = time.monotonic()
-                        elif state._cached_partial:
-                            partial = state._cached_partial
-                        else:
-                            partial = None
+                        if delta_t >= VAD_SILENCE_THRESHOLD_S:
+                            # Prefer the onset transcript; fall back to a cached partial.
+                            if state._onset_transcript:
+                                partial = state._onset_transcript
+                                state._cached_partial   = partial
+                                state._cached_partial_t = time.monotonic()
+                            elif state._cached_partial:
+                                partial = state._cached_partial
+                            else:
+                                partial = None
 
-                        if partial:
-                            # ── Step 1: harvest completed ensemble task ────────────
-                            if state._ensemble_task is not None and state._ensemble_task.done():
-                                try:
-                                    fire_decision = state._ensemble_task.result()
-                                except Exception:
-                                    fire_decision = False
+                            if partial:
+                                # Step 1 — harvest a completed ensemble task.
+                                if state._ensemble_task is not None and state._ensemble_task.done():
+                                    try:
+                                        fire_decision = state._ensemble_task.result()
+                                    except Exception:
+                                        fire_decision = False
 
-                                # Snapshot everything BEFORE fire_turn wipes state
-                                scored_partial  = state._ensemble_partial
-                                scored_label    = state.task_label
-                                scored_eos      = state.last_eos_score
-                                scored_llm      = state.last_llm_score
-                                scored_combined = state.last_combined_score
-                                scored_dyn      = state.current_silence_threshold
-                                state._ensemble_task = None
+                                    scored_partial  = state._ensemble_partial
+                                    scored_label    = state.task_label
+                                    scored_eos      = state.last_eos_score
+                                    scored_llm      = state.last_llm_score
+                                    scored_combined = state.last_combined_score
+                                    scored_dyn      = state.current_silence_threshold
+                                    state._ensemble_task = None
 
-                                if scored_label != "unknown":
+                                    if scored_label != "unknown":
+                                        await ws_send(ws, {
+                                            "type":            "task_label",
+                                            "label":           scored_label,
+                                            "stable":          True,
+                                            "elapsed_ms":      0,
+                                            "dyn_threshold_s": scored_dyn,
+                                        })
+
                                     await ws_send(ws, {
-                                        "type":            "task_label",
-                                        "label":           scored_label,
-                                        "stable":          True,
-                                        "elapsed_ms":      0,
-                                        "dyn_threshold_s": scored_dyn,
+                                        "type":             "scoring",
+                                        "task_label":       scored_label,
+                                        "eos_score":        round(scored_eos, 3),
+                                        "llm_score":        round(scored_llm, 3),
+                                        "combined_score":   round(scored_combined, 3),
+                                        "threshold":        ENSEMBLE_THRESHOLD,
+                                        "high_conf_threshold": HIGH_CONFIDENCE_THRESHOLD,
+                                        "dyn_threshold_s":  scored_dyn,
+                                        "fire":             fire_decision,
+                                        "early_fire": fire_decision and (
+                                            scored_combined >= HIGH_CONFIDENCE_THRESHOLD
+                                            and state._ensemble_delta_t < scored_dyn
+                                        ),
                                     })
 
-                                await ws_send(ws, {
-                                    "type":             "scoring",
-                                    "task_label":       scored_label,
-                                    "eos_score":        round(scored_eos, 3),
-                                    "llm_score":        round(scored_llm, 3),
-                                    "combined_score":   round(scored_combined, 3),
-                                    "threshold":        ENSEMBLE_THRESHOLD,
-                                    "high_conf_threshold": HIGH_CONFIDENCE_THRESHOLD,
-                                    "dyn_threshold_s":  scored_dyn,
-                                    "fire":             fire_decision,
-                                    # True when high-confidence override fired before the dynamic threshold
-                                    "early_fire": fire_decision and (
-                                        scored_combined >= HIGH_CONFIDENCE_THRESHOLD
-                                        and state._ensemble_delta_t < scored_dyn
-                                    ),
-                                })
+                                    if fire_decision:
+                                        log.info("Condition %s — ensemble approved — firing.", state.condition)
+                                        await fire_turn(ws, state, prefetched_transcript=scored_partial)
+                                        continue
+                                    else:
+                                        log.info("Condition %s — ensemble held.", state.condition)
+                                        # Advance the dedup key by one bucket so the next launch
+                                        # cannot fire until at least 0.5s more silence has elapsed.
+                                        next_bucket = round(int(delta_t / 0.5) * 0.5 + 0.5, 1)
+                                        state._last_scored_partial = (scored_partial, next_bucket)
 
-                                if fire_decision:
-                                    log.info("Condition %s — ensemble approved — firing.", state.condition)
-                                    await fire_turn(ws, state, prefetched_transcript=scored_partial)
-                                    continue
+                                # Step 2 — launch a new ensemble task if none is running.
+                                if state._ensemble_task is None:
+                                    # Skip if the (partial, silence_bucket) pair was already scored.
+                                    # The transcript rescores on each new 0.5s bucket.
+                                    silence_bucket = round(int(delta_t / 0.5) * 0.5, 1)
+                                    scored_key = (partial, silence_bucket)
+                                    if scored_key == state._last_scored_partial:
+                                        log.debug("Condition %s — (partial, bucket=%.1fs) unchanged, skipping ensemble launch.", state.condition, silence_bucket)
+                                    else:
+                                        state._last_scored_partial = scored_key
+                                        state._ensemble_partial = partial
+                                        state._ensemble_delta_t = delta_t
+                                        state._ensemble_task = asyncio.create_task(
+                                            should_fire_ensemble(partial, delta_t, state)
+                                        )
+                                        log.info("Condition %s — ensemble task launched (partial=%s, bucket=%.1fs).", state.condition, partial[:40] if partial else "", silence_bucket)
                                 else:
-                                    log.info("Condition %s — ensemble held.", state.condition)
-
-                            # ── Step 2: launch ensemble task if none running ────────
-                            if state._ensemble_task is None:
-                                state._ensemble_partial = partial
-                                state._ensemble_delta_t = delta_t
-                                state._ensemble_task = asyncio.create_task(
-                                    should_fire_ensemble(partial, delta_t, state)
-                                )
-                                log.info("Condition %s — ensemble task launched (partial=%s).", state.condition, partial[:40] if partial else "")
+                                    log.info("Condition %s — ensemble task still running, skipping chunk.", state.condition)
                             else:
-                                log.info("Condition %s — ensemble task still running, skipping chunk.", state.condition)
-                        else:
-                            log.info("Condition %s — no partial transcript yet, waiting.", state.condition)
+                                log.info("Condition %s — no partial transcript yet, waiting.", state.condition)
 
     except Exception as exc:
         log.exception("Unhandled error in WebSocket handler: %s", exc)
     finally:
         state.connected = False
         ping_task.cancel()
-        # Save this session's turn log. Use a per-connection copy so that
-        # a second client disconnecting concurrently does not overwrite a
-        # completed session's log before it has been downloaded.
-        # _last_session_log always reflects the most recently ended session.
+        # Copy the turn log before clearing state so a concurrent disconnect
+        # from another client cannot overwrite a completed session's data.
         global _last_session_log
         _last_session_log = list(state.turn_log)
         log.info("Session ended — %d turn log entries saved.", len(_last_session_log))
